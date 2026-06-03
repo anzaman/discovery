@@ -30,6 +30,7 @@ from discovery.common.auto_update import (
     is_opted_out,
     load_cache,
 )
+from discovery.common.job_history import history_path, is_disabled, load_history
 from discovery.common.paths import get_config_file_path
 from discovery.poll.az_extensions import check_required_extensions
 
@@ -44,6 +45,7 @@ _EXPECTED_MODULES = [
     "discovery.common",
     "discovery.common.auto_update",
     "discovery.common.config",
+    "discovery.common.job_history",
     "discovery.common.logging",
     "discovery.poll",
     "discovery.poll.api",
@@ -56,6 +58,7 @@ _EXPECTED_MODULES = [
     "discovery.poll.cli_configure",
     "discovery.poll.cli_doctor",
     "discovery.poll.cli_helpers",
+    "discovery.poll.cli_history",
     "discovery.poll.cli_smoke",
     "discovery.poll.cli_status",
     "discovery.poll.cli_storage",
@@ -226,6 +229,27 @@ def _render_az_extensions_section() -> bool:
     return True
 
 
+def _render_job_history_section() -> None:
+    """Surface the local job-history state (informational, never fails)."""
+    path = history_path()
+    if is_disabled():
+        console.print(
+            "  [yellow]![/yellow] Job history: [yellow]disabled[/yellow] "
+            "(DISCOVERY_NO_JOB_HISTORY is set)"
+        )
+        return
+    if not path.is_file():
+        console.print(
+            f"  Job history: [dim]empty[/dim] ({path} will be created on first submit)"
+        )
+        return
+    entries = load_history()
+    console.print(
+        f"  [green]✓[/green] Job history: {len(entries)} entr"
+        f"{'y' if len(entries) == 1 else 'ies'} at {path}"
+    )
+
+
 def _render_update_check_section() -> None:
     """Render the auto-update checker status.
 
@@ -321,6 +345,9 @@ def doctor_command() -> None:
     # surfaces the situation early with an actionable hint.
     if not _render_az_extensions_section():
         all_ok = False
+
+    # Local job-history status — informational only.
+    _render_job_history_section()
 
     # Update-checker status: surface the cached state so users can see
     # whether automatic update notifications will fire and when the
