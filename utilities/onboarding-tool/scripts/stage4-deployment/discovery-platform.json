@@ -5,21 +5,21 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39.26.7824",
-      "templateHash": "808327707704316604"
+      "templateHash": "12946762802184486479"
     }
   },
   "parameters": {
     "location": {
       "type": "string",
       "metadata": {
-        "description": "Region for all Discovery resources. Must equal the BYO VNet/subnet region."
+        "description": "Control-plane region for Discovery resources. Can differ from the VNet/subnet and managed-resource-group region."
       }
     },
     "workloadRegion": {
       "type": "string",
       "defaultValue": "[parameters('location')]",
       "metadata": {
-        "description": "workloadRegion tag (discovery.overridemrgregion) for the managed RGs."
+        "description": "Region for all managed-resource-group resources, set through discovery.overridemrgregion. Must match the VNet/subnet region."
       }
     },
     "supercomputerName": {
@@ -92,14 +92,7 @@
       "type": "string",
       "defaultValue": "",
       "metadata": {
-        "description": "Storage account id backing the bookshelf container."
-      }
-    },
-    "bookshelfInScope": {
-      "type": "bool",
-      "defaultValue": true,
-      "metadata": {
-        "description": "Whether the bookshelf storage container is in scope."
+        "description": "Storage account id backing the project storage container."
       }
     },
     "outboundType": {
@@ -135,7 +128,15 @@
     },
     "publicNetworkAccess": {
       "type": "string",
-      "defaultValue": "Disabled"
+      "defaultValue": "Enabled",
+      "allowedValues": [
+        "Enabled",
+        "Disabled"
+      ]
+    },
+    "networkIsolation": {
+      "type": "bool",
+      "defaultValue": true
     }
   },
   "resources": [
@@ -183,7 +184,6 @@
       ]
     },
     {
-      "condition": "[and(parameters('bookshelfInScope'), not(empty(parameters('storageAccountId'))))]",
       "type": "Microsoft.Discovery/storageContainers",
       "apiVersion": "2026-06-01",
       "name": "[parameters('storageContainerName')]",
@@ -205,7 +205,7 @@
         "discovery.workbench.enableGhcpAiFeatures": "true",
         "discovery.workbench.enableExtensions": "true",
         "discovery.overridemrgregion": "[parameters('workloadRegion')]",
-        "NetworkIsolation": "true",
+        "NetworkIsolation": "[string(parameters('networkIsolation'))]",
         "SkipAssociateKeyVaultToNsp": "true",
         "SkipAssociateCosmosDBToNsp": "true",
         "SkipAssociateStorageAccountsToNsp": "true"
@@ -246,7 +246,9 @@
       "name": "[format('{0}/{1}', parameters('workspaceName'), parameters('projectName'))]",
       "location": "[parameters('location')]",
       "properties": {
-        "storageContainerIds": "[if(and(parameters('bookshelfInScope'), not(empty(parameters('storageAccountId')))), createArray(resourceId('Microsoft.Discovery/storageContainers', parameters('storageContainerName'))), createArray())]"
+        "storageContainerIds": [
+          "[resourceId('Microsoft.Discovery/storageContainers', parameters('storageContainerName'))]"
+        ]
       },
       "dependsOn": [
         "[resourceId('Microsoft.Discovery/workspaces/chatModelDeployments', parameters('workspaceName'), parameters('chatModelDeploymentName'))]",

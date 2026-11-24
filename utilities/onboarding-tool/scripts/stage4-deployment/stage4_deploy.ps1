@@ -1,17 +1,26 @@
+#!/usr/bin/env pwsh
 #Requires -Version 7.0
+
 <#
-.SYNOPSIS  Stage 4 / FR4.1 - orchestrate Discovery platform deployment.
+.SYNOPSIS
+    Stage 4 / FR4.1 - orchestrate Discovery platform deployment.
 .DESCRIPTION
     Gates on Stage 3 readiness when provided, asserts Azure login, runs the
     ordered Stage 4 deployer, and surfaces recovery guidance for workspace-only
     failures. Single self-contained Stage 4 script folding in deploy_order.ps1,
     error_remediation_engine.ps1, true_state_detection.ps1, and recovery_reput.ps1.
-    Spec: ../../script-specs/stage4-deployment/stage4_deploy.md
+.PARAMETER DryRun
+    List deployment or Recovery actions offline without Azure calls or Bicep execution.
+    Reports use PLAN, not GO. PassThru returns objects without reports.
+
+.LINK
+    ../../script-specs/stage4-deployment/stage4_deploy.md
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$JsonPath,
+    [switch]$DryRun,
     [switch]$PassThru,
     [string]$BicepPath,
     [string]$ParametersPath,
@@ -23,7 +32,49 @@ param(
     [string]$Workspace
 )
 Import-Module (Join-Path $PSScriptRoot '..\lib\OnboardingCommon.psm1') -Force
+if ($DryRun) {
+    Write-OnboardingPlan -Stage 4 -ConfigPath $ConfigPath -Options $PSBoundParameters -JsonPath $JsonPath -PassThru:$PassThru -ErrorAction Stop
+    return
+}
 $script:DiscoveryApiVersion = '2026-06-01'
+
+function Get-WorkspacePublicNetworkAccess {
+    param([object]$Config)
+    $ws = if ($Config -and $Config.PSObject.Properties.Name -contains 'workspace') { $Config.workspace } else { $null }
+    $v = if ($ws -and $ws.PSObject.Properties.Name -contains 'publicNetworkAccess') { [string]$ws.publicNetworkAccess } else { '' }
+    if ($v -in @('Enabled', 'Disabled')) { return $v }
+    return 'Enabled'
+}
+
+function Get-WorkspaceNetworkIsolation {
+    param([object]$Config)
+    $ws = if ($Config -and $Config.PSObject.Properties.Name -contains 'workspace') { $Config.workspace } else { $null }
+    if ($ws -and $ws.PSObject.Properties.Name -contains 'networkIsolation' -and $null -ne $ws.networkIsolation) {
+        return [bool]$ws.networkIsolation
+    }
+    return $true
+}
+
+function Get-DefaultStorageContainerName {
+    param([Parameter(Mandatory)][string]$WorkspaceName)
+
+    $suffix = '-storage'
+    $prefixLength = 24 - $suffix.Length
+    $prefix = $WorkspaceName.Substring(0, [Math]::Min($WorkspaceName.Length, $prefixLength)).TrimEnd('-')
+    if (-not $prefix) {
+        throw "Workspace name '$WorkspaceName' cannot produce a valid default storage-container name."
+    }
+    return "$prefix$suffix"
+}
+
+function Get-Stage4WorkspaceConfigFailure {
+    param([AllowEmptyString()][string]$WorkspaceName)
+
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceName)) { return $null }
+    return New-CheckResult -Id 'deploy-config-workspace' -Name 'deployment workspace name' -Status 'Fail' -Fr 'FR4.1' `
+        -Detail 'Config does not include a nonblank names.workspace value.' `
+        -Remediation 'Add names.workspace to the onboarding config, rerun Stage 1 validation, and then rerun Stage 4.'
+}
 
 function Resolve-DiscoveryError {
     [CmdletBinding()]
@@ -31,6 +82,12 @@ function Resolve-DiscoveryError {
 
     $text = $ErrorText
     $rules = @(
+        [pscustomobject]@{
+            Signature   = 'Insufficient model TPM quota (InsufficientQuota on Cognitive Services deployment)'
+            RootCause   = 'the workspace provisions its own model deployment (gpt-5.4 GlobalStandard, 250K TPM) in its managed Foundry account, and the subscription does not have that much free TPM quota in the workload region'
+            Remediation = 'free or request TPM quota for the model named in the error in the workload region (Foundry portal > Quotas, or delete unused deployments), then re-run Stage 4 to re-PUT the workspace; if it stays Failed, delete the workspace and re-run with a new workspace name. Stage 1 check model-quota reports the shortfall up front'
+            Match       = { param($t) $t -match '(?is)InsufficientQuota|Tokens Per Minute' }
+        }
         [pscustomobject]@{
             Signature   = 'Insufficient VM quota (VmSkuQuota)'
             RootCause   = 'the subscription does not have enough vCPU quota in the region for the supercomputer system pool (3 nodes of the system SKU) that the service validates at submit time'
@@ -40,13 +97,13 @@ function Resolve-DiscoveryError {
         [pscustomobject]@{
             Signature   = 'Creation not supported in region'
             RootCause   = 'the target region is not a Discovery-creatable region for this resource type (the ARM-advertised location list can be broader than what the service allows for creation)'
-            Remediation = 'deploy into a Discovery-creatable region (for supercomputers/storageContainers eastus is confirmed creatable; eastus2 is rejected despite being advertised) and place the BYO VNet/subnets in that same region so the supercomputer stays co-regional with its node pool subnet'
+            Remediation = 'set controlPlaneRegion to a Discovery-creatable region for the affected resource type; independently, keep the VNet/subnets and all managed-resource-group resources in workloadRegion'
             Match       = { param($t) $t -match '(?is)Creation of new .* resources is not supported in region|is not supported in region' }
         }
         [pscustomobject]@{
             Signature   = 'RegionMismatch on supercomputer/nodePool SubnetId'
-            RootCause   = 'supercomputer location (controlPlaneRegion) differs from the BYO VNet/subnet region'
-            Remediation = 'set controlPlaneRegion to the region of the managedcluster/nodepool VNet so the supercomputer is co-regional with its subnets, then delete the failed supercomputer and re-run (region is immutable)'
+            RootCause   = 'the managed-resource-group workload region differs from the BYO VNet/subnet region'
+            Remediation = 'set workloadRegion to the VNet/subnet region, or use a VNet in workloadRegion; all managed-resource-group resources must share that region. controlPlaneRegion can differ. Existing managed resources may need to be recreated to change region'
             Match       = { param($t) $t -match '(?is)RegionMismatch|Region mismatch for dependent resource|must be in the same region as the primary resource' }
         }
         [pscustomobject]@{
@@ -162,6 +219,26 @@ function Get-FailedDeploymentError {
     return ($parts | Select-Object -Unique) -join ' | '
 }
 
+function Get-ManagedRgFailureText {
+    <#
+    .SYNOPSIS Return distinct failed-operation errors from a Discovery resource's managed RG.
+    .DESCRIPTION The workspace RP reports a generic InternalServerError; the actionable cause
+    (e.g. InsufficientQuota on the model deployment) is only in the managed RG activity log.
+    #>
+    param([string]$ResourceId)
+    if (-not $ResourceId) { return '' }
+    $mrg = Invoke-Az -Args @('resource', 'show', '--ids', $ResourceId, '--api-version', $script:DiscoveryApiVersion, '--query', 'properties.managedResourceGroup', '-o', 'tsv') -AllowFail
+    if ([string]::IsNullOrWhiteSpace($mrg)) { return '' }
+    $events = Get-AzJson -Args @('monitor', 'activity-log', 'list', '-g', $mrg.Trim(), '--offset', '6h', '--status', 'Failed') -AllowFail
+    $lines = foreach ($e in @($events)) {
+        $msg = "$($e.properties.statusMessage)".Trim()
+        if (-not $msg) { continue }
+        $res = "$($e.resourceId)".Split('/')[-1]
+        "[$($e.operationName.value) $res] $msg"
+    }
+    return (@($lines | Select-Object -Unique) -join ' | ')
+}
+
 function Get-DiscoveryArmState {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ResourceId)
@@ -197,25 +274,36 @@ function Test-DiscoveryTrueState {
 
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     $transient = @('Accepted', 'Creating', 'Running', 'Updating', 'Provisioning')
-    $terminal = @('Succeeded', 'Failed', 'Canceled', 'Cancelled', 'NotFound')
+    $failed = @('Failed', 'Canceled', 'Cancelled', 'NotFound')
     $listState = if ($ResourceId) { Get-DiscoveryArmState -ResourceId $ResourceId } else { 'NotChecked' }
     $trueState = $listState
     $source = 'arm'
 
     while ($true) {
         if ($AccountName -and $ResourceGroup) {
+            # FR4.3: the Foundry account only tightens the gate (catches a false ARM Succeeded);
+            # it never overrides a failed or still-provisioning ARM state.
             $source = 'cognitiveservices'
-            $trueState = Get-FoundryAccountState -ResourceGroup $ResourceGroup -AccountName $AccountName
+            $foundryState = Get-FoundryAccountState -ResourceGroup $ResourceGroup -AccountName $AccountName
+            $states = @(@($listState, $foundryState) | Where-Object { $_ -ne 'NotChecked' })
+            $bad = @($states | Where-Object { $failed -contains $_ })
+            $busy = @($states | Where-Object { $transient -contains $_ })
+            $other = @($states | Where-Object { $_ -ne 'Succeeded' })
+            $trueState = 'Succeeded'
+            if ($bad.Count) { $trueState = $bad[0] } elseif ($busy.Count) { $trueState = $busy[0] } elseif ($other.Count) { $trueState = $other[0] }
         }
 
-        if ($terminal -contains $trueState -or -not ($transient -contains $trueState)) { break }
+        if (-not ($transient -contains $trueState)) { break }
         if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Seconds $PollSeconds
-        if ($ResourceId) { $listState = Get-DiscoveryArmState -ResourceId $ResourceId }
+        if ($ResourceId) {
+            $listState = Get-DiscoveryArmState -ResourceId $ResourceId
+            if (-not ($AccountName -and $ResourceGroup)) { $trueState = $listState }
+        }
     }
 
     $timedOut = ($transient -contains $trueState) -and (Get-Date) -ge $deadline
-    $verdict = if ($timedOut) { 'Fail' } elseif ($trueState -eq 'Succeeded' -and ($listState -eq 'Succeeded' -or $listState -eq 'NotChecked')) { 'Pass' } elseif ($trueState -eq 'Succeeded') { 'Warn' } else { 'Fail' }
+    $verdict = if ($timedOut) { 'Fail' } elseif ($trueState -eq 'Succeeded') { 'Pass' } else { 'Fail' }
     [pscustomobject]@{
         resource   = $ResourceId
         account    = $AccountName
@@ -326,6 +414,27 @@ function Get-VNetRegionFromSubnetId {
     return $loc.Trim()
 }
 
+function Get-Stage4NetworkRegionFailures {
+    param([object]$Config, [string]$ResourceGroup)
+
+    $region = [string]$Config.workloadRegion
+    $roles = @('managedcluster', 'nodepool', 'agent-containerapp', 'workspace-containerapp', 'search-containerapp', 'private-endpoints')
+    $outboundType = Get-ObjProp -Object $Config.network -Name 'outboundType'
+    if (-not $outboundType -or $outboundType -eq 'UserDefinedRouting') { $roles += 'spare' }
+    foreach ($role in $roles) {
+        $subnetId = Get-SubnetIdByRole -Config $Config -Role $role -ResourceGroup $ResourceGroup
+        if (-not $subnetId) { continue }
+        $actual = Get-VNetRegionFromSubnetId -SubnetId $subnetId
+        if (-not $actual -or $actual -ne $region) {
+            $detail = if ($actual) { "RegionMismatch workloadRegion=$region actual=$actual" } else { "Could not resolve VNet region for workloadRegion=$region" }
+            New-CheckResult -Id 'deploy-network-region' -Name 'workload and VNet region alignment' -Status 'Fail' -Fr 'FR4.1' `
+                -Detail "$detail role=$role subnet=$subnetId provisioningState=NotSubmitted" `
+                -Remediation "Verify the VNet is readable and in workloadRegion ($region). Set workloadRegion to the VNet region or use subnets in workloadRegion; all managed-resource-group resources must share that region. controlPlaneRegion can differ." `
+                -Data ([pscustomobject]@{ expected = $region; actual = $actual; role = $role; subnetId = $subnetId })
+        }
+    }
+}
+
 function Get-ManagedIdentityId {
     param([object]$Config, [string]$ResourceGroup)
     foreach ($containerName in @('managedIdentity', 'workspaceIdentity', 'identity')) {
@@ -350,7 +459,7 @@ function Get-StorageAccountId {
     $account = Get-ObjProp -Object $storage -Name 'account'
     if ($account) {
         # Mirror Stage 2's storage-RG precedence (storage.resourceGroup/resourceGroupName,
-        # then the network RG) so the derived id points at the account Stage 2 actually created.
+        # then the network RG). Stage 1 normally writes storage.accountId, so this is a fallback.
         $storageRg = Get-ObjProp -Object $storage -Name 'resourceGroup'
         if (-not $storageRg) { $storageRg = Get-ObjProp -Object $storage -Name 'resourceGroupName' }
         if (-not $storageRg) {
@@ -364,6 +473,123 @@ function Get-StorageAccountId {
         return "/subscriptions/$($Config.subscriptionId)/resourceGroups/$storageRg/providers/Microsoft.Storage/storageAccounts/$account"
     }
     return ''
+}
+
+function Grant-FoundryRolesOnManagedRg {
+    <#
+    .SYNOPSIS Assign Foundry roles on the workspace managed RG.
+    .DESCRIPTION The managed RG only exists after the workspace is created, so Stage 2 cannot
+    grant these. Platform Administrator principals (or the deploying identity when the config lists
+    none) get Foundry Owner; Platform Contributor principals get Foundry User. Failures are Warn:
+    the platform is deployed, only Foundry portal edits break.
+    #>
+    param([object]$Config, [string]$WorkspaceId)
+    $foundryRoleIds = @{ 'Foundry Owner' = 'c883944f-8b7b-4483-af10-35834be79c4a'; 'Foundry User' = '53ca6127-db72-4b80-b1b0-d745d6d5456d' }
+    $mrg = Invoke-Az -Args @('resource', 'show', '--ids', $WorkspaceId, '--api-version', $script:DiscoveryApiVersion, '--query', 'properties.managedResourceGroup', '-o', 'tsv') -AllowFail
+    $mrg = "$mrg".Trim()
+    if ($mrg -match '/resourceGroups/([^/]+)') { $mrg = $Matches[1] }
+    if (-not $mrg) {
+        return @(New-CheckResult -Id 'foundry-roles-mrg' -Name 'Foundry roles on workspace managed RG' -Status 'Warn' -Fr 'FR4.1' `
+                -Detail "Could not read properties.managedResourceGroup from $WorkspaceId, so Foundry Owner/User were not assigned." `
+                -Remediation 'Find the managed resource group on the workspace overview page. Assign Foundry Owner to administrators and Foundry User to the users who edit agents and workflows in the Foundry portal.')
+    }
+    $scope = "/subscriptions/$($Config.subscriptionId)/resourceGroups/$mrg"
+
+    $principals = @()
+    $cfgPrincipals = Get-ObjProp -Object $Config -Name 'principals'
+    foreach ($p in @($cfgPrincipals)) {
+        if (-not $p) { continue }
+        $role = [string](@((Get-ObjProp -Object $p -Name 'role'), (Get-ObjProp -Object $p -Name 'roleName'), (Get-ObjProp -Object $p -Name 'discoveryRole')) | Where-Object { $_ } | Select-Object -First 1)
+        $oid = [string](@((Get-ObjProp -Object $p -Name 'objectId'), (Get-ObjProp -Object $p -Name 'principalId'), (Get-ObjProp -Object $p -Name 'id')) | Where-Object { $_ } | Select-Object -First 1)
+        if ($oid -and $role -match '^Platform[ -]?Administrator$') {
+            $principals += [pscustomobject]@{ ObjectId = $oid; Type = [string](Get-ObjProp -Object $p -Name 'type'); Role = 'Foundry Owner' }
+        }
+        elseif ($oid -and $role -match '^Platform[ -]?Contributor$') {
+            $principals += [pscustomobject]@{ ObjectId = $oid; Type = [string](Get-ObjProp -Object $p -Name 'type'); Role = 'Foundry User' }
+        }
+    }
+    if (-not @($principals | Where-Object { $_.Role -eq 'Foundry Owner' }).Count) {
+        $deployer = Get-ObjProp -Object $Config -Name 'deployingIdentity'
+        $oid = Get-ObjProp -Object $deployer -Name 'objectId'
+        if ($oid) { $principals += [pscustomobject]@{ ObjectId = [string]$oid; Type = [string](Get-ObjProp -Object $deployer -Name 'type'); Role = 'Foundry Owner' } }
+    }
+    if (-not $principals.Count) {
+        return @(New-CheckResult -Id 'foundry-roles-mrg' -Name 'Foundry roles on workspace managed RG' -Status 'Warn' -Fr 'FR4.1' `
+                -Detail "No principals or deployingIdentity.objectId in config, so Foundry Owner/User were not assigned on $mrg." `
+                -Remediation "Assign Foundry Owner on $scope to administrators and Foundry User to the users who edit agents and workflows in the Foundry portal.")
+    }
+
+    $out = @()
+    $pimEligibilityCount = 0
+    foreach ($pr in $principals) {
+        $roleId = $foundryRoleIds[$pr.Role]
+        $name = "$($pr.Role) on workspace managed RG"
+        $id = "foundry-$($pr.Role.Split(' ')[1].ToLowerInvariant())-mrg-$($pr.ObjectId)"
+        $ptype = switch -Regex ($pr.Type) { '^user$' { 'User' } 'servicePrincipal|managedIdentity' { 'ServicePrincipal' } 'group' { 'Group' } default { $null } }
+        $data = @{ principal = $pr.ObjectId; role = $pr.Role; roleDefinitionId = $roleId; scope = $scope }
+        $isJitUser = Test-CustomerJitManagedUser -Config $Config -PrincipalType $ptype
+        try {
+            $exists = Get-AzJson -Args @('role', 'assignment', 'list', '--assignee', $pr.ObjectId, '--role', $roleId, '--scope', $scope) -AllowFail:(-not $isJitUser)
+        }
+        catch {
+            $out += New-CheckResult -Id $id -Name $name -Status 'Warn' -Fr 'FR4.1' `
+                -Detail "Could not check active Foundry role assignments for $($pr.ObjectId) on ${mrg}: $($_.Exception.Message)" `
+                -Remediation "Grant permission to read role assignments at $scope, then rerun Stage 4 before creating or changing this user's access." `
+                -Data $data
+            continue
+        }
+        if ($exists -and @($exists).Count) {
+            $data.state = 'exists'
+            $out += New-CheckResult -Id $id -Name $name -Status 'Pass' -Fr 'FR4.1' -Detail "Already assigned to $($pr.ObjectId) on $mrg." -Data $data
+            continue
+        }
+        if ($isJitUser) {
+            try {
+                $durationDays = [int]$Config.rbac.jitEligibilityDurationDays
+                $eligibility = Set-PimRoleEligibility -SubscriptionId $Config.subscriptionId -PrincipalId $pr.ObjectId `
+                    -RoleId $roleId -Scope $scope -DurationDays $durationDays `
+                    -Justification "Discovery onboarding: $($pr.Role) on workspace managed resource group"
+                foreach ($property in $eligibility.PSObject.Properties) { $data[$property.Name] = $property.Value }
+                $eligibilityDetail = if ($eligibility.state -eq 'eligible-created') {
+                    "Created PIM eligibility for $($pr.ObjectId) for $durationDays days."
+                }
+                else {
+                    $expires = if ($eligibility.eligibilityEndDateTime) { " until $($eligibility.eligibilityEndDateTime)" } else { '' }
+                    "Reused existing PIM eligibility for $($pr.ObjectId)$expires."
+                }
+                $out += New-CheckResult -Id $id -Name $name -Status 'Pass' -Fr 'FR4.1' `
+                    -Detail "$eligibilityDetail The role is eligible, not active." `
+                    -Remediation "Customer must activate $($pr.Role) on $scope in PIM before using it." `
+                    -Data $data
+                $pimEligibilityCount++
+            }
+            catch {
+                $out += New-CheckResult -Id $id -Name $name -Status 'Warn' -Fr 'FR4.1' `
+                    -Detail "Could not create or verify PIM eligibility for $($pr.Role) and $($pr.ObjectId) on ${mrg}: $($_.Exception.Message)" `
+                    -Remediation "Use an identity permitted to write Microsoft.Authorization/roleEligibilityScheduleRequests at $scope, create the eligible assignment in PIM, and then activate it." `
+                    -Data $data
+            }
+            continue
+        }
+        $azArgs = @('role', 'assignment', 'create', '--assignee-object-id', $pr.ObjectId, '--role', $roleId, '--scope', $scope)
+        if ($ptype) { $azArgs += @('--assignee-principal-type', $ptype) }
+        try {
+            Invoke-Az -Args $azArgs | Out-Null
+            $out += New-CheckResult -Id $id -Name $name -Status 'Pass' -Fr 'FR4.1' -Detail "Assigned to $($pr.ObjectId) on $mrg." -Data $data
+        }
+        catch {
+            $out += New-CheckResult -Id $id -Name $name -Status 'Warn' -Fr 'FR4.1' `
+                -Detail "Could not assign $($pr.Role) to $($pr.ObjectId) on ${mrg}: $($_.Exception.Message)" `
+                -Remediation "Have an Owner or User Access Administrator run: az role assignment create --assignee-object-id $($pr.ObjectId) --role $roleId --scope $scope" `
+                -Data $data
+        }
+    }
+    if ($pimEligibilityCount) {
+        $out += New-CheckResult -Id 'foundry-roles-pim-activation' -Name 'Foundry PIM activation required' -Status 'Warn' -Fr 'FR4.1' `
+            -Detail "$pimEligibilityCount Foundry user role assignment(s) are eligible but not activated." `
+            -Remediation 'Each customer user must activate the required Foundry role in PIM before opening or editing the workspace.'
+    }
+    return $out
 }
 
 # Discover the workspace's managed AI Foundry (CognitiveServices) account so FR4.3 can verify
@@ -490,13 +716,9 @@ function Invoke-BicepDeploymentOnce {
 }
 
 function New-Stage4BicepParamFile {
-    param([object]$Config, [string]$ResourceGroup, [string]$Location)
+    param([object]$Config, [string]$ResourceGroup, [string]$Location, [string]$StorageContainerName)
 
     $names = Get-ObjProp -Object $Config -Name 'names'
-    $bookshelf = Get-ObjProp -Object $Config -Name 'bookshelf'
-    $inScope = Get-ObjProp -Object $bookshelf -Name 'inScope'
-    $bookshelfInScope = if ($null -ne $inScope) { [bool]$inScope } else { $true }
-
     $p = [ordered]@{
         location                = $Location
         workloadRegion          = [string]$Config.workloadRegion
@@ -504,7 +726,7 @@ function New-Stage4BicepParamFile {
         workspaceName           = [string](Get-ObjProp -Object $names -Name 'workspace')
         projectName             = [string](Get-ObjProp -Object $names -Name 'project')
         nodePoolName            = [string](Get-ObjProp -Object $names -Name 'nodePool')
-        storageContainerName    = [string](Get-ObjProp -Object $names -Name 'storageContainer')
+        storageContainerName    = $(if ($StorageContainerName) { $StorageContainerName } else { [string](Get-ObjProp -Object $names -Name 'storageContainer') })
         chatModelDeploymentName = 'gpt-5-4'
         chatModelName           = 'gpt-5.4'
         managedIdentityId       = Get-ManagedIdentityId -Config $Config -ResourceGroup $ResourceGroup
@@ -514,7 +736,8 @@ function New-Stage4BicepParamFile {
         workspaceSubnetId       = Get-SubnetIdByRole -Config $Config -Role 'workspace-containerapp' -ResourceGroup $ResourceGroup
         privateEndpointSubnetId = Get-SubnetIdByRole -Config $Config -Role 'private-endpoints' -ResourceGroup $ResourceGroup
         storageAccountId        = Get-StorageAccountId -Config $Config -ResourceGroup $ResourceGroup
-        bookshelfInScope        = $bookshelfInScope
+        publicNetworkAccess     = Get-WorkspacePublicNetworkAccess -Config $Config
+        networkIsolation        = Get-WorkspaceNetworkIsolation -Config $Config
     }
     foreach ($opt in 'systemSku', 'nodePoolVmSize', 'nodePoolScaleSetPriority') {
         $v = Get-ObjProp -Object $Config -Name $opt
@@ -560,10 +783,30 @@ Invoke-Az -Args @('account', 'set', '--subscription', $subscriptionId) | Out-Nul
 
 $location = [string]$cfg.controlPlaneRegion
 $workspaceName = Get-ConfigName -Config $cfg -Name 'workspace' -Default ''
+$workspaceConfigFailure = Get-Stage4WorkspaceConfigFailure -WorkspaceName $workspaceName
+if ($workspaceConfigFailure) {
+    $results.Add($workspaceConfigFailure)
+    if ($PassThru) { return $results.ToArray() }
+    $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
+    Complete-Stage -Results $results.ToArray()
+}
 $projectName = Get-ConfigName -Config $cfg -Name 'project' -Default "$workspaceName-project"
 $supercomputerName = Get-ConfigName -Config $cfg -Name 'supercomputer' -Default ''
 $nodePoolName = Get-ConfigName -Config $cfg -Name 'nodePool' -Default ''
-$storageContainerName = Get-ConfigName -Config $cfg -Name 'storageContainer' -Default "$workspaceName-bookshelf"
+$configuredStorageContainerName = Get-ConfigName -Config $cfg -Name 'storageContainer' -Default ''
+$storageContainerName = if ($configuredStorageContainerName) {
+    $configuredStorageContainerName
+} else {
+    Get-DefaultStorageContainerName -WorkspaceName $workspaceName
+}
+if (-not $configuredStorageContainerName) {
+    # Earlier releases defaulted to '<workspace>-bookshelf'; keep using it on reruns so the project's container doesn't change.
+    $legacyContainerName = "$workspaceName-bookshelf"
+    if ($legacyContainerName.Length -le 24) {
+        $legacyContainerId = New-DiscoveryId -SubscriptionId $subscriptionId -ResourceGroup $resourceGroup -TypePath 'storageContainers' -NamePath $legacyContainerName
+        if ((Get-ArmState -ResourceId $legacyContainerId) -ne 'NotFound') { $storageContainerName = $legacyContainerName }
+    }
+}
 $managedIdentityId = Get-ManagedIdentityId -Config $cfg -ResourceGroup $resourceGroup
 if ([string]::IsNullOrWhiteSpace($managedIdentityId)) {
     $results.Add((New-CheckResult -Id 'deploy-managed-identity' -Name 'deployment managed identity' -Status 'Fail' -Fr 'FR4.1' `
@@ -601,7 +844,7 @@ if (-not [string]::IsNullOrWhiteSpace($uamiRolesRaw)) {
 if ($null -eq $uamiRoles) {
     $results.Add((New-CheckResult -Id 'deploy-managed-identity-roles' -Name 'managed identity role assignments' -Status 'Warn' -Fr 'FR4.1' `
                 -Detail 'Could not read role assignments for the UAMI (insufficient permission to list role assignments, or a transient error); UAMI role coverage was not verified.' `
-                -Remediation 'Verify manually that the UAMI holds Microsoft Discovery Platform Contributor (Preview), Storage Blob Data Contributor and AcrPull on the deployment resource group, plus Network Contributor on the managedcluster and nodepool subnets (or their VNet), then proceed.' `
+                -Remediation 'Verify manually that the UAMI holds Microsoft Discovery Platform Contributor, Storage Blob Data Contributor and AcrPull on the deployment resource group, plus Network Contributor on the managedcluster and nodepool subnets (or their VNet), then proceed.' `
                 -Data ([pscustomobject]@{ principalId = $uamiPrincipalId; verified = $false })))
 }
 else {
@@ -615,7 +858,7 @@ else {
     $scSubnetScopes = @($scNetRoles | ForEach-Object { Get-SubnetIdByRole -Config $cfg -Role $_ -ResourceGroup $resourceGroup } | Where-Object { $_ } | Select-Object -Unique)
     $ownerId = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'; $contributorId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
     $requiredUamiRoles = @(
-        [pscustomobject]@{ name = 'Microsoft Discovery Platform Contributor (Preview)'; id = '01288891-85ee-45a7-b367-9db3b752fc65'; scope = $rgScope; accepts = @() }
+        [pscustomobject]@{ name = 'Microsoft Discovery Platform Contributor'; id = '01288891-85ee-45a7-b367-9db3b752fc65'; scope = $rgScope; accepts = @() }
         [pscustomobject]@{ name = 'Storage Blob Data Contributor'; id = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'; scope = $rgScope; accepts = @() }
         [pscustomobject]@{ name = 'AcrPull'; id = '7f951dda-4ed3-4680-a7ca-43fe172d538d'; scope = $rgScope; accepts = @() }
     )
@@ -660,22 +903,16 @@ $chatModelId = "$workspaceId/chatModelDeployments/gpt-5-4"
 $storageContainerId = New-DiscoveryId -SubscriptionId $subscriptionId -ResourceGroup $resourceGroup -TypePath 'storageContainers' -NamePath $storageContainerName
 $projectId = "$workspaceId/projects/$projectName"
 
-# Region co-location pre-flight (applies to both Bicep and ARM paths). The supercomputer must be
-# co-regional with its managedcluster/nodepool subnets; discovery.overridemrgregion does not relax it.
-if (-not $Recovery -and $location) {
-    $preflightSubnet = Get-SubnetIdByRole -Config $cfg -Role 'managedcluster' -ResourceGroup $resourceGroup
-    if ($preflightSubnet) {
-        $preflightRegion = Get-VNetRegionFromSubnetId -SubnetId $preflightSubnet
-        if ($preflightRegion -and $preflightRegion -ne $location) {
-            $results.Add((New-CheckResult -Id 'deploy-supercomputer' -Name 'supercomputer deployment' -Status 'Fail' -Fr 'FR4.1' `
-                        -Detail "resource=$supercomputerId provisioningState=NotSubmitted RegionMismatch expected=$location actual=$preflightRegion subnet=$preflightSubnet" `
-                        -Remediation "controlPlaneRegion ($location) must match the managedcluster/nodepool VNet region ($preflightRegion); the supercomputer and its node pool subnet must be co-regional. Set controlPlaneRegion=$preflightRegion, delete the failed supercomputer, and re-run (region is immutable)." `
-                        -Data ([pscustomobject]@{ expected = $location; actual = $preflightRegion; subnetId = $preflightSubnet })))
-            if ($PassThru) { return $results.ToArray() }
-            $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
-            Complete-Stage -Results $results.ToArray()
-        }
+# Validate workload/VNet alignment before either Bicep or ARM submits resources.
+if (-not $Recovery) {
+    $regionFailures = @(Get-Stage4NetworkRegionFailures -Config $cfg -ResourceGroup $resourceGroup)
+    if ($regionFailures.Count) {
+        $results.AddRange($regionFailures)
+        if ($PassThru) { return $results.ToArray() }
+        $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
+        Complete-Stage -Results $results.ToArray()
     }
+    $preflightSubnet = Get-SubnetIdByRole -Config $cfg -Role 'managedcluster' -ResourceGroup $resourceGroup
     # Subnet-topology pre-flight. Supercomputer system nodes join the managedcluster subnet, so it must
     # carry no delegation; with UserDefinedRouting the API server needs a separate management subnet
     # ('spare' role / managementSubnet) delegated to Microsoft.ContainerService/managedClusters.
@@ -743,7 +980,7 @@ if (-not $NoBicep -and -not $Recovery -and -not $BicepPath) {
                 $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
                 Complete-Stage -Results $results.ToArray()
             }
-            $generatedParamFile = New-Stage4BicepParamFile -Config $cfg -ResourceGroup $resourceGroup -Location $location
+            $generatedParamFile = New-Stage4BicepParamFile -Config $cfg -ResourceGroup $resourceGroup -Location $location -StorageContainerName $storageContainerName
             $ParametersPath = $generatedParamFile
         }
     }
@@ -763,23 +1000,11 @@ if (-not $BicepPath) {
     if (-not $location) { $scMissing += 'controlPlaneRegion' }
     if (-not $managedIdentityId) { $scMissing += 'managedIdentity.id or names.managedIdentity' }
     if (-not $scSubnet) { $scMissing += 'managedcluster subnet id/name' }
-    $regionMismatch = $null
-    if ($location -and $scSubnet) {
-        $subnetRegion = Get-VNetRegionFromSubnetId -SubnetId $scSubnet
-        if ($subnetRegion -and $subnetRegion -ne $location) {
-            $regionMismatch = [pscustomobject]@{ expected = $location; actual = $subnetRegion; subnetId = $scSubnet }
-        }
-    }
     if ($scMissing.Count) {
         $results.Add((New-CheckResult -Id 'deploy-supercomputer' -Name 'supercomputer deployment' -Status 'Fail' -Fr 'FR4.1' `
                     -Detail "resource=$supercomputerId provisioningState=NotSubmitted missing=$($scMissing -join ',')" `
                     -Remediation 'Supply the missing config values or provide -BicepPath/-ParametersPath for the platform template.' `
                     -Data ([pscustomobject]@{ resource = $supercomputerId; provisioningState = 'NotSubmitted'; missing = $scMissing })))
-    } elseif ($regionMismatch) {
-        $results.Add((New-CheckResult -Id 'deploy-supercomputer' -Name 'supercomputer deployment' -Status 'Fail' -Fr 'FR4.1' `
-                    -Detail "resource=$supercomputerId provisioningState=NotSubmitted RegionMismatch expected=$($regionMismatch.expected) actual=$($regionMismatch.actual) subnet=$($regionMismatch.subnetId)" `
-                    -Remediation "controlPlaneRegion ($($regionMismatch.expected)) must match the managedcluster/nodepool VNet region ($($regionMismatch.actual)); the supercomputer and its node pool subnet must be co-regional. Set controlPlaneRegion=$($regionMismatch.actual), delete the failed supercomputer, and re-run (region is immutable)." `
-                    -Data $regionMismatch))
     } else {
         $scNet = Get-ObjProp -Object $cfg -Name 'network'
         $scOutboundType = Get-ObjProp -Object $scNet -Name 'outboundType'
@@ -860,7 +1085,7 @@ if ($scStateBeforeWorkspace -eq 'Failed') {
                     'discovery.workbench.enableGhcpAiFeatures'   = 'true'
                     'discovery.workbench.enableExtensions'       = 'true'
                     'discovery.overridemrgregion'                = [string]$cfg.workloadRegion
-                    NetworkIsolation                             = 'true'
+                    NetworkIsolation                             = (Get-WorkspaceNetworkIsolation -Config $cfg).ToString().ToLowerInvariant()
                     SkipAssociateKeyVaultToNsp                  = 'true'
                     SkipAssociateCosmosDBToNsp                  = 'true'
                     SkipAssociateStorageAccountsToNsp           = 'true'
@@ -871,7 +1096,7 @@ if ($scStateBeforeWorkspace -eq 'Failed') {
                     agentSubnetId          = $agentSubnet
                     privateEndpointSubnetId = $peSubnet
                     workspaceSubnetId      = $workspaceSubnet
-                    publicNetworkAccess    = 'Disabled'
+                    publicNetworkAccess    = Get-WorkspacePublicNetworkAccess -Config $cfg
                 }
             }
             $put = Invoke-ArmPut -ResourceId $workspaceId -Body $wsBody
@@ -896,7 +1121,12 @@ if ($scStateBeforeWorkspace -eq 'Failed') {
                         -Remediation 'Set foundry.accountName and foundry.resourceGroup (the managed AI Foundry/CognitiveServices account) so FR4.3 can verify the workspace dependency true-state.' `
                         -Data $gate))
         } else {
-            $results.Add((New-StepResult -Id 'deploy-workspace' -Name 'workspace deployment' -ResourceId $workspaceId -State $state -Fr 'FR4.1,FR4.3' -ErrorText $put.error -Extra $gate))
+            $wsError = $put.error
+            if ($state -ne 'Succeeded') {
+                $mrgErr = Get-ManagedRgFailureText -ResourceId $workspaceId
+                if ($mrgErr) { $wsError = (@("managedRG: $mrgErr", $wsError) | Where-Object { $_ }) -join ' | ' }
+            }
+            $results.Add((New-StepResult -Id 'deploy-workspace' -Name 'workspace deployment' -ResourceId $workspaceId -State $state -Fr 'FR4.1,FR4.3' -ErrorText $wsError -Extra $gate))
         }
     }
 }
@@ -919,15 +1149,28 @@ if (@($results | Where-Object { $_.id -eq 'deploy-chat-model-gpt-5-4' -and $_.st
     Complete-Stage -Results $results.ToArray()
 }
 
-$bookshelfInScope = $true
-$bookshelf = Get-ObjProp -Object $cfg -Name 'bookshelf'
-$configuredInScope = Get-ObjProp -Object $bookshelf -Name 'inScope'
-if ($null -ne $configuredInScope) { $bookshelfInScope = [bool]$configuredInScope }
 $storageAccountId = Get-StorageAccountId -Config $cfg -ResourceGroup $resourceGroup
-$projectProps = @{}
-$preExistingStorageState = if ($bookshelfInScope) { Get-ArmState -ResourceId $storageContainerId } else { 'Skipped' }
-if ($bookshelfInScope -and $preExistingStorageState -eq 'Succeeded') { $projectProps.storageContainerIds = @($storageContainerId) }
-$projectBody = @{ location = $location; properties = $projectProps }
+if ($storageAccountId) {
+    $storageBody = @{ location = $location; properties = @{ storageStore = @{ kind = 'AzureStorageBlob'; storageAccountId = $storageAccountId } } }
+    $storagePut = Invoke-ArmPut -ResourceId $storageContainerId -Body $storageBody
+    $storageGate = Wait-DiscoveryGate -ResourceId $storageContainerId
+    $storageState = $storageGate.trueState -replace '^TimedOut:', ''
+    $results.Add((New-StepResult -Id 'deploy-project-storage' -Name 'project storage container' -ResourceId $storageContainerId -State $storageState -Fr 'FR4.1' -ErrorText $storagePut.error -Extra $storageGate))
+}
+else {
+    $results.Add((New-CheckResult -Id 'deploy-project-storage' -Name 'project storage container' -Status 'Fail' -Fr 'FR4.1' `
+                -Detail "resource=$storageContainerId provisioningState=NotSubmitted missing=storage.accountId or storage.account" `
+                -Remediation 'Supply the storage account id/name required for every Discovery project storage container.' `
+                -Data ([pscustomobject]@{ resource = $storageContainerId; provisioningState = 'NotSubmitted' })))
+}
+
+if (@($results | Where-Object { $_.id -eq 'deploy-project-storage' -and $_.status -eq 'Fail' }).Count) {
+    if ($PassThru) { return $results.ToArray() }
+    $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
+    Complete-Stage -Results $results.ToArray()
+}
+
+$projectBody = @{ location = $location; properties = @{ storageContainerIds = @($storageContainerId) } }
 $projectPut = Invoke-ArmPut -ResourceId $projectId -Body $projectBody
 $projectGate = Wait-DiscoveryGate -ResourceId $projectId
 $projectState = $projectGate.trueState -replace '^TimedOut:', ''
@@ -939,31 +1182,7 @@ if (@($results | Where-Object { $_.id -eq 'deploy-project' -and $_.status -eq 'F
     Complete-Stage -Results $results.ToArray()
 }
 
-if ($bookshelfInScope -and $storageAccountId) {
-    $storageBody = @{ location = $location; properties = @{ storageStore = @{ kind = 'AzureStorageBlob'; storageAccountId = $storageAccountId } } }
-    $storagePut = Invoke-ArmPut -ResourceId $storageContainerId -Body $storageBody
-    $storageGate = Wait-DiscoveryGate -ResourceId $storageContainerId
-    $storageState = $storageGate.trueState -replace '^TimedOut:', ''
-    $results.Add((New-StepResult -Id 'deploy-bookshelf' -Name 'bookshelf storage container' -ResourceId $storageContainerId -State $storageState -Fr 'FR4.1' -ErrorText $storagePut.error -Extra $storageGate))
-
-    # The project was created before the bookshelf container, so on a first run
-    # storageContainerIds was omitted. Re-link it now that the container has Succeeded.
-    if ($storageState -eq 'Succeeded' -and ($projectProps.Keys -notcontains 'storageContainerIds')) {
-        $linkBody = @{ location = $location; properties = @{ storageContainerIds = @($storageContainerId) } }
-        $linkPut = Invoke-ArmPut -ResourceId $projectId -Body $linkBody
-        $linkGate = Wait-DiscoveryGate -ResourceId $projectId
-        $linkState = $linkGate.trueState -replace '^TimedOut:', ''
-        $results.Add((New-StepResult -Id 'link-bookshelf-project' -Name 'link bookshelf container to project' -ResourceId $projectId -State $linkState -Fr 'FR4.1' -ErrorText $linkPut.error -Extra $linkGate))
-    }
-} elseif ($bookshelfInScope) {
-    $results.Add((New-CheckResult -Id 'deploy-bookshelf' -Name 'bookshelf storage container' -Status 'Fail' -Fr 'FR4.1' `
-                -Detail "resource=$storageContainerId provisioningState=NotSubmitted missing=storage.accountId or storage.account" `
-                -Remediation 'Supply the storage account id/name used by the Discovery storage container.' `
-                -Data ([pscustomobject]@{ resource = $storageContainerId; provisioningState = 'NotSubmitted' })))
-} else {
-    $results.Add((New-CheckResult -Id 'deploy-bookshelf' -Name 'bookshelf storage container' -Status 'Skip' -Fr 'FR4.1' `
-                -Detail 'bookshelf.inScope=false' -Data ([pscustomobject]@{ resource = $storageContainerId; provisioningState = 'Skipped' })))
-}
+foreach ($r in @(Grant-FoundryRolesOnManagedRg -Config $cfg -WorkspaceId $workspaceId)) { $results.Add($r) }
 
 if ($PassThru) { return $results.ToArray() }
 $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 4 · deploy order (FR4.1-FR4.2)' -JsonPath $JsonPath
@@ -1108,7 +1327,7 @@ if (-not $workspaceObj) {
                 $value = Get-ObjProp -Object $props -Name $key
                 if ($value) { $bodyProps[$key] = $value }
             }
-            $bodyProps.publicNetworkAccess = 'Disabled'
+            $bodyProps.publicNetworkAccess = Get-WorkspacePublicNetworkAccess -Config $cfg
             $body = [ordered]@{
                 location   = $workspaceObj.location
                 tags       = $workspaceObj.tags
@@ -1134,17 +1353,30 @@ if (-not @($results | Where-Object { $_.status -eq 'Fail' }).Count) {
 
 if (-not @($results | Where-Object { $_.status -eq 'Fail' }).Count) {
     $projectName = Get-ConfigName -Config $cfg -Name 'project' -Default "$Workspace-project"
-    $storageContainerName = Get-ConfigName -Config $cfg -Name 'storageContainer' -Default "$Workspace-bookshelf"
+    $storageContainerName = Get-ConfigName -Config $cfg -Name 'storageContainer' -Default (Get-DefaultStorageContainerName -WorkspaceName $Workspace)
+    if (-not (Get-ConfigName -Config $cfg -Name 'storageContainer' -Default '')) {
+        # Earlier releases defaulted to '<workspace>-bookshelf'; recover against it if that's what exists.
+        $legacyContainerName = "$Workspace-bookshelf"
+        if ($legacyContainerName.Length -le 24) {
+            $legacyContainerId = "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.Discovery/storageContainers/$legacyContainerName"
+            if ((Get-ArmState -ResourceId $legacyContainerId) -ne 'NotFound') { $storageContainerName = $legacyContainerName }
+        }
+    }
     $storageContainerId = "/subscriptions/$Subscription/resourceGroups/$ResourceGroup/providers/Microsoft.Discovery/storageContainers/$storageContainerName"
     $storageState = Get-ArmState -ResourceId $storageContainerId
-    $projectProps = @{}
-    if ($storageState -eq 'Succeeded') { $projectProps.storageContainerIds = @($storageContainerId) }
-    $projectId = "$workspaceId/projects/$projectName"
-    $projectBody = @{ location = [string]$workspaceObj.location; properties = $projectProps }
-    $projectPut = Invoke-ArmPut -ResourceId $projectId -Body $projectBody
-    $projectGate = Wait-DiscoveryGate -ResourceId $projectId
-    $projectState = $projectGate.trueState -replace '^TimedOut:', ''
-    $results.Add((New-StepResult -Id 'recovery-project' -Name 'post-recovery project' -ResourceId $projectId -State $projectState -Fr 'FR4.5' -ErrorText $projectPut.error -Extra ([pscustomobject]@{ trueState = $projectGate; storageContainerState = $storageState })))
+    if ($storageState -ne 'Succeeded') {
+        $results.Add((New-CheckResult -Id 'recovery-project-storage' -Name 'post-recovery project storage' -Status 'Fail' -Fr 'FR4.5' `
+                    -Detail "Storage container $storageContainerId is $storageState; a project cannot be recovered without storage." `
+                    -Remediation 'Deploy or recover the project storage container, then rerun recovery.'))
+    }
+    else {
+        $projectId = "$workspaceId/projects/$projectName"
+        $projectBody = @{ location = [string]$workspaceObj.location; properties = @{ storageContainerIds = @($storageContainerId) } }
+        $projectPut = Invoke-ArmPut -ResourceId $projectId -Body $projectBody
+        $projectGate = Wait-DiscoveryGate -ResourceId $projectId
+        $projectState = $projectGate.trueState -replace '^TimedOut:', ''
+        $results.Add((New-StepResult -Id 'recovery-project' -Name 'post-recovery project' -ResourceId $projectId -State $projectState -Fr 'FR4.5' -ErrorText $projectPut.error -Extra ([pscustomobject]@{ trueState = $projectGate; storageContainerState = $storageState })))
+    }
 }
 
 if ($PassThru) { return $results.ToArray() }

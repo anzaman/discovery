@@ -1,6 +1,9 @@
-﻿#Requires -Version 7.0
+#!/usr/bin/env pwsh
+#Requires -Version 7.0
+
 <#
-.SYNOPSIS  Stage 2 / FR2.1-FR2.9 — prepare the Discovery landing zone.
+.SYNOPSIS
+    Stage 2 / FR2.1-FR2.9 — prepare the Discovery landing zone.
 .DESCRIPTION
     Single self-contained Stage 2 script. Prepares the landing zone in dependency order and aggregates reports.
 
@@ -14,15 +17,25 @@
     UDR route tables, and private DNS zones/links — FR2.2-FR2.5) instead of the
     former imperative nsg_rules.ps1 / route_tables.ps1 / private_dns.ps1 az calls.
 
-    Spec: ../../script-specs/stage2-landing-zone/stage2_prepare.md
+.PARAMETER DryRun
+    List intended actions offline without Azure calls. Reports use PLAN, not GO.
+    PassThru returns plan objects without writing JsonPath reports.
+
+.LINK
+    ../../script-specs/stage2-landing-zone/stage2_prepare.md
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$JsonPath,
+    [switch]$DryRun,
     [switch]$PassThru
 )
 Import-Module (Join-Path $PSScriptRoot '..\lib\OnboardingCommon.psm1') -Force
+if ($DryRun) {
+    Write-OnboardingPlan -Stage 2 -ConfigPath $ConfigPath -Options $PSBoundParameters -JsonPath $JsonPath -PassThru:$PassThru -ErrorAction Stop
+    return
+}
 
 function Invoke-RpRegister {
     param(
@@ -104,6 +117,100 @@ foreach ($namespace in $providers) {
     return $results.ToArray()
 }
 
+function Grant-OnboardingRole {
+    # Idempotent role assignment that returns one check result.
+    param(
+        [Parameter(Mandatory)][string]$PrincipalId,
+        [string]$PrincipalType,
+        [Parameter(Mandatory)][string]$RoleName,
+        [Parameter(Mandatory)][string]$RoleId,
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$ScopeLabel,
+        [string]$Fr = 'FR2.1',
+        [string]$IdPrefix = 'rbac',
+        [object]$Config
+    )
+    $resultId = "$IdPrefix-$($ScopeLabel)-$($RoleName.ToLowerInvariant().Replace(' ', '-'))-$PrincipalId"
+    $data = @{ principal = $PrincipalId; role = $RoleName; roleDefinitionId = $RoleId; scope = $Scope }
+    try {
+        $isJitUser = $Config -and (Test-CustomerJitManagedUser -Config $Config -PrincipalType $PrincipalType)
+        $exists = Get-AzJson -Args @('role', 'assignment', 'list', '--assignee', $PrincipalId, '--role', $RoleId, '--scope', $Scope) -AllowFail:(-not $isJitUser)
+        if ($exists -and @($exists).Count -gt 0) {
+            $data.state = 'exists'
+            return New-CheckResult -Id $resultId -Name "$RoleName on $ScopeLabel" -Status 'Pass' -Fr $Fr -Detail "Already assigned to $PrincipalId." -Data $data
+        }
+        if ($isJitUser) {
+            $durationDays = [int]$Config.rbac.jitEligibilityDurationDays
+            $eligibility = Set-PimRoleEligibility -SubscriptionId $Config.subscriptionId -PrincipalId $PrincipalId `
+                -RoleId $RoleId -Scope $Scope -DurationDays $durationDays `
+                -Justification "Discovery onboarding: $RoleName on $ScopeLabel"
+            foreach ($property in $eligibility.PSObject.Properties) { $data[$property.Name] = $property.Value }
+            $eligibilityDetail = if ($eligibility.state -eq 'eligible-created') {
+                "Created PIM eligibility for $PrincipalId for $durationDays days."
+            }
+            else {
+                $expires = if ($eligibility.eligibilityEndDateTime) { " until $($eligibility.eligibilityEndDateTime)" } else { '' }
+                "Reused existing PIM eligibility for $PrincipalId$expires."
+            }
+            return New-CheckResult -Id $resultId -Name "$RoleName on $ScopeLabel" -Status 'Pass' -Fr $Fr `
+                -Detail "$eligibilityDetail The role is eligible, not active." `
+                -Remediation "Customer must activate $RoleName at $Scope in PIM before using it." `
+                -Data $data
+        }
+        $azArgs = @('role', 'assignment', 'create', '--assignee-object-id', $PrincipalId, '--role', $RoleId, '--scope', $Scope)
+        if ($PrincipalType) { $azArgs += @('--assignee-principal-type', $PrincipalType) }
+        Invoke-Az -Args $azArgs | Out-Null
+        $data.state = 'created'
+        return New-CheckResult -Id $resultId -Name "$RoleName on $ScopeLabel" -Status 'Pass' -Fr $Fr -Detail "Assigned to $PrincipalId." -Data $data
+    }
+    catch {
+        $remediation = if ($Config -and (Test-CustomerJitManagedUser -Config $Config -PrincipalType $PrincipalType)) {
+            "Human RBAC preparation failed while checking active access or creating PIM eligibility. Run Stage 2 with permission to read role assignments and write Microsoft.Authorization/roleEligibilityScheduleRequests at $Scope, confirm the tenant has PIM licensing, and verify the requested eligibility policy permits at least $($Config.rbac.jitEligibilityDurationDays) days."
+        }
+        elseif ($PrincipalType -eq 'User' -and $_.Exception.Message -match 'RequestDisallowedByPolicy') {
+            "Azure Policy denied the permanent User assignment. Select rbac.humanAccessMode=customer-jit-managed and use the customer JIT/PIM process, or obtain a policy-approved exception. Owner does not override a policy deny."
+        }
+        else {
+            "Run as Owner, User Access Administrator, or Role Based Access Control Administrator at $Scope, or have one of them run: az role assignment create --assignee-object-id $PrincipalId --role $RoleId --scope $Scope"
+        }
+        return New-CheckResult -Id $resultId -Name "$RoleName on $ScopeLabel" -Status 'Fail' -Fr $Fr `
+            -Detail $_.Exception.Message `
+            -Remediation $remediation `
+            -Data $data
+    }
+}
+
+function Get-Stage2TargetResourceGroups {
+    param([Parameter(Mandatory)][object]$Config)
+
+    function Get-Value {
+        param([object]$Object, [string[]]$Names)
+        if (-not $Object) { return $null }
+        foreach ($name in $Names) {
+            if ($Object.PSObject.Properties.Name -contains $name -and $Object.$name) { return $Object.$name }
+        }
+        return $null
+    }
+
+    $network = Get-Value $Config @('network')
+    $storage = Get-Value $Config @('storage')
+    $set = [ordered]@{}
+    $candidates = @(
+        (Get-Value $network @('networkResourceGroup', 'resourceGroup', 'rg')),
+        (Get-Value $network @('dnsResourceGroup')),
+        (Get-Value $Config @('resourceGroup', 'resourceGroupName', 'discoveryResourceGroup')),
+        (Get-Value $storage @('resourceGroup', 'resourceGroupName'))
+    )
+    $storageAccountId = Get-Value $storage @('accountId', 'id')
+    if ($storageAccountId -and $storageAccountId -match '/resourceGroups/([^/]+)') {
+        $candidates += $Matches[1]
+    }
+    foreach ($rg in $candidates) {
+        if ($rg -and -not $set.Contains($rg)) { $set[$rg] = $true }
+    }
+    return @($set.Keys)
+}
+
 function Invoke-RbacAssign {
     param(
         [Parameter(Mandatory)][object]$Config,
@@ -122,20 +229,6 @@ function Get-ConfigValue {
         if ($Object.PSObject.Properties.Name -contains $name -and $Object.$name) { return $Object.$name }
     }
     return $null
-}
-
-function Get-TargetResourceGroups {
-    $set = [ordered]@{}
-    $candidates = @(
-        (Get-ConfigValue $cfg.network @('networkResourceGroup', 'resourceGroup', 'rg')),
-        (Get-ConfigValue $cfg @('resourceGroup', 'resourceGroupName', 'discoveryResourceGroup')),
-        (Get-ConfigValue $cfg.storage @('resourceGroup', 'resourceGroupName')),
-        (Get-ConfigValue $cfg @('dnsResourceGroup'))
-    )
-    foreach ($rg in $candidates) {
-        if ($rg -and -not $set.Contains($rg)) { $set[$rg] = $true }
-    }
-    return @($set.Keys)
 }
 
 $roles = [ordered]@{
@@ -176,7 +269,7 @@ function Convert-PrincipalType {
     }
 }
 
-$resourceGroups = Get-TargetResourceGroups
+$resourceGroups = Get-Stage2TargetResourceGroups -Config $cfg
 if ($resourceGroups.Count -eq 0) {
     $results.Add((New-CheckResult -Id 'rbac-target-rg' -Name 'target resource groups' -Status 'Fail' -Fr 'FR2.1' `
                 -Detail 'No target resource group found in config.' `
@@ -190,37 +283,105 @@ else {
     }
 }
 
+# Azure built-in roles Learn lists for the Discovery administrator, in addition to Platform
+# Administrator. Reader is granted at subscription scope below; Foundry Owner is assigned by
+# Stage 4 on the workspace managed resource group.
+$adminAzureRoles = [ordered]@{
+    'Managed Identity Contributor'  = 'e40ec5ca-96e0-45a2-b4ff-59039f2c2b59'
+    'Managed Identity Operator'     = 'f1a07417-d97a-45cb-824c-7a7467783830'
+    'Storage Account Contributor'   = '17d1049b-9a84-46fb-8f53-869881c3d3ab'
+    'Storage Blob Data Contributor' = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+    'Network Contributor'           = '4d97b98b-1d4f-4787-a291-c67834d212e7'
+    'AcrPush'                       = '8311e382-0749-4cb8-b61a-304f252e45ec'
+}
+
 foreach ($rg in $resourceGroups) {
     $scope = "/subscriptions/$($cfg.subscriptionId)/resourceGroups/$rg"
+    # Roles can't be assigned on a resource group that doesn't exist yet (for example the network
+    # resource group on a first run), so create it here; later steps reuse it.
+    $rgExists = Get-AzJson -Args @('group', 'exists', '--name', $rg) -AllowFail
+    if ($rgExists -ne $true) {
+        try {
+            Invoke-Az -Args @('group', 'create', '--name', $rg, '--location', $cfg.workloadRegion) | Out-Null
+            $results.Add((New-CheckResult -Id "rbac-rg-$rg" -Name "resource group $rg" -Status 'Pass' -Fr 'FR2.1' `
+                        -Detail "Created in $($cfg.workloadRegion) so roles can be assigned on it." -Data @{ resourceGroup = $rg; state = 'created' }))
+        }
+        catch {
+            $results.Add((New-CheckResult -Id "rbac-rg-$rg" -Name "resource group $rg" -Status 'Fail' -Fr 'FR2.1' `
+                        -Detail $_.Exception.Message `
+                        -Remediation "Run as Owner or Contributor at subscription scope, or create resource group $rg first."))
+            continue
+        }
+    }
     foreach ($roleName in $roles.Keys) {
         foreach ($principal in @(Get-PrincipalsForRole -RoleName $roleName)) {
-            $roleId = $roles[$roleName]
-            $resultId = "rbac-$($rg)-$($roleName.ToLowerInvariant().Replace(' ', '-'))-$($principal.ObjectId)"
-            try {
-                $exists = Get-AzJson -Args @('role', 'assignment', 'list', '--assignee', $principal.ObjectId, '--role', $roleId, '--scope', $scope) -AllowFail
-                if ($exists -and @($exists).Count -gt 0) {
-                    $results.Add((New-CheckResult -Id $resultId -Name "$roleName on $rg" -Status 'Pass' -Fr 'FR2.1' `
-                                -Detail "Already assigned to $($principal.ObjectId)." `
-                                -Data @{ principal = $principal.ObjectId; role = $roleName; roleDefinitionId = $roleId; scope = $scope; state = 'exists' }))
-                    continue
-                }
-
-                $args = @('role', 'assignment', 'create', '--assignee-object-id', $principal.ObjectId, '--role', $roleId, '--scope', $scope)
-                $ptype = Convert-PrincipalType $principal.Type
-                if ($ptype) { $args += @('--assignee-principal-type', $ptype) }
-                Invoke-Az -Args $args | Out-Null
-                $results.Add((New-CheckResult -Id $resultId -Name "$roleName on $rg" -Status 'Pass' -Fr 'FR2.1' `
-                            -Detail "Assigned to $($principal.ObjectId)." `
-                            -Data @{ principal = $principal.ObjectId; role = $roleName; roleDefinitionId = $roleId; scope = $scope; state = 'created' }))
-            }
-            catch {
-                $results.Add((New-CheckResult -Id $resultId -Name "$roleName on $rg" -Status 'Fail' -Fr 'FR2.1' `
-                            -Detail $_.Exception.Message `
-                            -Remediation 'Run as Owner, User Access Administrator, or Role Based Access Control Administrator at the target resource group scope.'))
-            }
+            $results.Add((Grant-OnboardingRole -PrincipalId $principal.ObjectId -PrincipalType (Convert-PrincipalType $principal.Type) `
+                        -RoleName $roleName -RoleId $roles[$roleName] -Scope $scope -ScopeLabel $rg -Config $cfg))
+        }
+    }
+    foreach ($principal in @(Get-PrincipalsForRole -RoleName 'Platform Administrator')) {
+        foreach ($roleName in $adminAzureRoles.Keys) {
+            $results.Add((Grant-OnboardingRole -PrincipalId $principal.ObjectId -PrincipalType (Convert-PrincipalType $principal.Type) `
+                        -RoleName $roleName -RoleId $adminAzureRoles[$roleName] -Scope $scope -ScopeLabel $rg -Config $cfg))
         }
     }
 }
+
+if ($resourceGroups.Count) {
+    foreach ($principal in @(Get-PrincipalsForRole -RoleName 'Platform Administrator')) {
+        $results.Add((Grant-OnboardingRole -PrincipalId $principal.ObjectId -PrincipalType (Convert-PrincipalType $principal.Type) `
+                    -RoleName 'Reader' -RoleId 'acdd72a7-3385-48ef-bd42-f606fba81ae7' -Scope "/subscriptions/$($cfg.subscriptionId)" -ScopeLabel 'subscription' -Config $cfg))
+    }
+    $results.Add((New-CheckResult -Id 'rbac-foundry-owner' -Name 'Foundry Owner on workspace managed RG' -Status 'Skip' -Fr 'FR2.1' `
+                -Detail "The workspace managed resource group does not exist until Stage 4 creates the workspace. Stage 4 $(if ($cfg.rbac.humanAccessMode -eq 'customer-jit-managed') { 'creates PIM eligibility for' } else { 'assigns' }) Foundry Owner there to Platform Administrator principals."))
+}
+
+    $jitRequests = @($results | Where-Object { $_.data -and $_.data.state -like 'eligible-*' } | ForEach-Object { $_.data })
+    if ($jitRequests.Count) {
+        try {
+            $outDir = if ($JsonPath) {
+                Split-Path -Parent ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($JsonPath))
+            }
+            else {
+                Join-Path (Split-Path -Parent $PSScriptRoot) 'out'
+            }
+            if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+            $configuredWorkspaceName = Get-ConfigValue $cfg.names @('workspace')
+            $workspaceName = if ($configuredWorkspaceName) { [string]$configuredWorkspaceName } else { 'discovery' }
+            $jsonArtifact = Join-Path $outDir "human-pim-eligibility-$workspaceName.json"
+            $mdArtifact = Join-Path $outDir "human-pim-eligibility-$workspaceName.md"
+            $artifact = [ordered]@{
+                humanAccessMode             = 'customer-jit-managed'
+                jitEligibilityDurationDays  = [int]$cfg.rbac.jitEligibilityDurationDays
+                assignments                 = $jitRequests
+            }
+            $artifact | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $jsonArtifact -Encoding utf8
+            $md = [System.Collections.Generic.List[string]]::new()
+            $md.Add('# Customer-managed human PIM eligibility')
+            $md.Add('')
+            $md.Add("Requested duration for new eligibility: $($cfg.rbac.jitEligibilityDurationDays) days")
+            $md.Add('')
+            $md.Add('| Principal | Role | Scope | Eligibility state |')
+            $md.Add('|---|---|---|---|')
+            foreach ($request in $jitRequests) {
+                $md.Add("| $($request.principal) | $($request.role) | $($request.scope) | $($request.state) |")
+            }
+            $md.Add('')
+            $md.Add('The onboarding tool created or verified these time-bound eligible assignments. They are not active. Each user must activate the required role in PIM before using Discovery or running a stage that depends on that role.')
+            ($md -join "`n") | Set-Content -LiteralPath $mdArtifact -Encoding utf8
+            $results.Add((New-CheckResult -Id 'rbac-human-jit-artifact' -Name 'human PIM eligibility artifact' -Status 'Pass' -Fr 'FR2.1' `
+                        -Detail "Wrote $jsonArtifact and $mdArtifact." `
+                        -Data @{ jsonPath = $jsonArtifact; markdownPath = $mdArtifact; assignmentCount = $jitRequests.Count }))
+            $results.Add((New-CheckResult -Id 'rbac-human-jit-activation' -Name 'customer PIM activation required' -Status 'Warn' -Fr 'FR2.1' `
+                        -Detail "Stage 2 created or verified $($jitRequests.Count) eligible User role assignment(s), but eligibility is not activation." `
+                        -Remediation "Before Stage 3/4 or interactive Discovery use, each customer user must open PIM and activate the required role(s). See $mdArtifact. Stage 2 does not fail merely because these new eligible assignments are not active." `
+                        -Data @{ markdownPath = $mdArtifact; assignmentCount = $jitRequests.Count; activationRequired = $true }))
+        }
+        catch {
+            $results.Add((New-CheckResult -Id 'rbac-human-jit-artifact' -Name 'human PIM eligibility artifact' -Status 'Fail' -Fr 'FR2.1' `
+                        -Detail $_.Exception.Message -Remediation 'Ensure the Stage 2 output directory is writable and rerun.'))
+        }
+    }
 
     return $results.ToArray()
 }
@@ -237,6 +398,7 @@ function Invoke-NspPerimeterJoinerRole {
 
 $roleName = 'Discovery NSP Perimeter Joiner'
 $controlPlaneAppId = '92c174ac-8e41-4815-a1b7-d81b19ab03ce'
+$readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
 $scope = "/subscriptions/$($cfg.subscriptionId)"
 $actions = @(
     'Microsoft.Network/networkSecurityPerimeters/joinPerimeterRule/action',
@@ -328,9 +490,18 @@ try {
         $assignedState = 'exists'
     }
 
+    $readerAssignment = Get-AzJson -Args @('role', 'assignment', 'list', '--assignee', $sp.id, '--role', $readerRoleId, '--scope', $scope) -AllowFail
+    if (-not $readerAssignment -or @($readerAssignment).Count -eq 0) {
+        Invoke-Az -Args @('role', 'assignment', 'create', '--assignee-object-id', $sp.id, '--assignee-principal-type', 'ServicePrincipal', '--role', $readerRoleId, '--scope', $scope) | Out-Null
+        $readerAssignedState = 'created'
+    }
+    else {
+        $readerAssignedState = 'exists'
+    }
+
     $results.Add((New-CheckResult -Id 'nsp-perimeter-joiner-role' -Name 'NSP Perimeter Joiner custom role and assignment' -Status 'Pass' -Fr 'FR2.1a' `
-                -Detail "role=$effectiveRoleName state=$(($equivalentRoleUsed) ? 'existing-equivalent' : (($needsWrite) ? 'created-or-updated' : 'exists')); assignment=$assignedState" `
-                -Data @{ roleName = $effectiveRoleName; roleDefinitionId = $roleAfter.name; appId = $controlPlaneAppId; principalObjectId = $sp.id; scope = $scope; actions = $actions; assigned = $assignedState }))
+                -Detail "role=$effectiveRoleName state=$(($equivalentRoleUsed) ? 'existing-equivalent' : (($needsWrite) ? 'created-or-updated' : 'exists')); joinerAssignment=$assignedState; readerAssignment=$readerAssignedState" `
+                -Data @{ roleName = $effectiveRoleName; roleDefinitionId = $roleAfter.name; appId = $controlPlaneAppId; principalObjectId = $sp.id; scope = $scope; actions = $actions; assigned = $assignedState; readerRoleDefinitionId = $readerRoleId; readerAssigned = $readerAssignedState }))
 }
 catch {
     $results.Add((New-CheckResult -Id 'nsp-perimeter-joiner-role' -Name 'NSP Perimeter Joiner custom role and assignment' -Status 'Fail' -Fr 'FR2.1a' `
@@ -339,6 +510,23 @@ catch {
 }
 
     return $results.ToArray()
+}
+
+function Get-Stage2PrivateDnsZones {
+    return @(
+        'privatelink.blob.core.windows.net',
+        'privatelink.queue.core.windows.net',
+        'privatelink.file.core.windows.net',
+        'privatelink.table.core.windows.net',
+        'privatelink.dfs.core.windows.net',
+        'privatelink.vaultcore.azure.net',
+        'privatelink.search.windows.net',
+        'privatelink.cognitiveservices.azure.com',
+        'privatelink.openai.azure.com',
+        'privatelink.services.ai.azure.com',
+        'privatelink.documents.azure.com',
+        'privatelink.azurecr.io'
+    )
 }
 
 function New-Stage2NetworkParamFile {
@@ -357,15 +545,19 @@ function New-Stage2NetworkParamFile {
     }
     $outboundType = if (($net.PSObject.Properties.Name -contains 'outboundType') -and $net.outboundType) { [string]$net.outboundType } else { 'UserDefinedRouting' }
     $nvaNextHop = if (($net.PSObject.Properties.Name -contains 'nvaNextHop') -and $net.nvaNextHop) { [string]$net.nvaNextHop } else { '' }
+    $networkRg = if (($net.PSObject.Properties.Name -contains 'networkResourceGroup') -and $net.networkResourceGroup) { [string]$net.networkResourceGroup } else { '' }
+    $dnsRg = if (($net.PSObject.Properties.Name -contains 'dnsResourceGroup') -and $net.dnsResourceGroup) { [string]$net.dnsResourceGroup } else { $networkRg }
 
     $p = [ordered]@{
-        location     = $Location
-        vnetName     = $VnetName
-        vnetCidr     = [string]$net.vnetCidr
-        subnets      = $subnets
-        outboundType = $outboundType
-        nvaNextHop   = $nvaNextHop
-        corpDns      = $corpDns
+        location         = $Location
+        vnetName         = $VnetName
+        vnetCidr         = [string]$net.vnetCidr
+        subnets          = $subnets
+        outboundType     = $outboundType
+        nvaNextHop       = $nvaNextHop
+        corpDns          = $corpDns
+        createPrivateDns = $dnsRg -eq $networkRg
+        privateDnsZones  = @(Get-Stage2PrivateDnsZones)
     }
     $paramObject = [ordered]@{}
     foreach ($k in $p.Keys) { $paramObject[$k] = @{ value = $p[$k] } }
@@ -420,6 +612,8 @@ function New-ChildName {
 }
 
 $rg = Get-ConfigValue $cfg.network @('networkResourceGroup', 'resourceGroup', 'rg')
+$dnsRg = Get-ConfigValue $cfg.network @('dnsResourceGroup')
+if (-not $dnsRg) { $dnsRg = $rg }
 $vnetName = Get-VNetName
 $location = $cfg.workloadRegion
 
@@ -453,6 +647,9 @@ if ($outboundType -eq 'UserDefinedRouting' -and -not $cfg.network.nvaNextHop) {
 try {
     Assert-AzLogin -SubscriptionId $cfg.subscriptionId
     Invoke-Az -Args @('group', 'create', '--name', $rg, '--location', $location) | Out-Null
+    if ($dnsRg -ne $rg) {
+        Invoke-Az -Args @('group', 'create', '--name', $dnsRg, '--location', $location) | Out-Null
+    }
 
     $bicepFile = Join-Path $PSScriptRoot 'network.bicep'
     if (-not (Test-Path -LiteralPath $bicepFile)) {
@@ -495,15 +692,123 @@ try {
                     -Detail 'outboundType=LoadBalancer; no user route tables (Azure system routes + NSG allow-list govern egress).'))
     }
 
+    if ($dnsRg -eq $rg) {
+        $dnsData = [pscustomobject]@{ resourceGroup = $dnsRg; zones = @(Get-Stage2PrivateDnsZones); state = 'deployed-by-bicep' }
+    }
+    else {
+        $dnsData = Ensure-NetworkPrivateDnsZones -SubscriptionId $cfg.subscriptionId -DnsResourceGroup $dnsRg `
+            -VNetId $vnetId -DnsZones @(Get-Stage2PrivateDnsZones) -LinkName "link-$vnetName"
+    }
     $results.Add((New-CheckResult -Id 'network-private-dns' -Name 'private DNS zones' -Status 'Pass' -Fr 'FR2.5' `
-                -Detail 'privatelink.* zones created and linked to the VNet via network.bicep.'))
+                -Detail "privatelink.* zones are in '$dnsRg' and linked to the VNet." -Data $dnsData))
 }
 catch {
     $results.Add((New-CheckResult -Id 'network-provision' -Name 'network provisioning' -Status 'Fail' -Fr 'FR2.2' `
-                -Detail $_.Exception.Message -Remediation 'Run with Network Contributor on the network resource group and retry; check network.bicep parameter values.'))
+                -Detail $_.Exception.Message -Remediation 'Run with Network Contributor on the network and configured DNS resource groups, then retry; check network.bicep parameter values.'))
 }
 
     return $results.ToArray()
+}
+
+function Ensure-PrivateDnsZoneLink {
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$DnsResourceGroup,
+        [Parameter(Mandatory)][string]$VNetId,
+        [Parameter(Mandatory)][string]$DnsZone,
+        [Parameter(Mandatory)][string]$LinkName
+    )
+
+    $zone = Get-AzJson -Args @('network', 'private-dns', 'zone', 'show', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-n', $DnsZone) -AllowFail
+    if (-not $zone) {
+        Invoke-Az -Args @('network', 'private-dns', 'zone', 'create', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-n', $DnsZone) | Out-Null
+        $zone = Get-AzJson -Args @('network', 'private-dns', 'zone', 'show', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-n', $DnsZone) -AllowFail
+    }
+    if (-not $zone -or -not $zone.id) {
+        throw "Private DNS zone '$DnsZone' could not be verified in resource group '$DnsResourceGroup'."
+    }
+
+    $links = @(Get-AzJson -Args @('network', 'private-dns', 'link', 'vnet', 'list', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-z', $DnsZone) -AllowFail)
+    $link = @($links | Where-Object {
+            $_.virtualNetwork -and $_.virtualNetwork.id -eq $VNetId
+        } | Select-Object -First 1)
+    if (-not $link.Count) {
+        Invoke-Az -Args @('network', 'private-dns', 'link', 'vnet', 'create', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-n', $LinkName, '--zone-name', $DnsZone, '--virtual-network', $VNetId, '--registration-enabled', 'false') | Out-Null
+        $links = @(Get-AzJson -Args @('network', 'private-dns', 'link', 'vnet', 'list', '--subscription', $SubscriptionId, '-g', $DnsResourceGroup, '-z', $DnsZone) -AllowFail)
+        $link = @($links | Where-Object {
+                $_.virtualNetwork -and $_.virtualNetwork.id -eq $VNetId
+            } | Select-Object -First 1)
+    }
+    if (-not $link.Count -or $link[0].provisioningState -ne 'Succeeded') {
+        $state = if ($link.Count) { [string]$link[0].provisioningState } else { 'NotFound' }
+        throw "Private DNS zone '$DnsZone' does not have a succeeded link to VNet '$VNetId' (state=$state)."
+    }
+
+    return [pscustomobject]@{ zone = $zone; link = $link[0] }
+}
+
+function Ensure-NetworkPrivateDnsZones {
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$DnsResourceGroup,
+        [Parameter(Mandatory)][string]$VNetId,
+        [Parameter(Mandatory)][string[]]$DnsZones,
+        [Parameter(Mandatory)][string]$LinkName
+    )
+
+    $states = @()
+    foreach ($dnsZone in $DnsZones) {
+        $state = Ensure-PrivateDnsZoneLink -SubscriptionId $SubscriptionId -DnsResourceGroup $DnsResourceGroup `
+            -VNetId $VNetId -DnsZone $dnsZone -LinkName $LinkName
+        $states += [pscustomobject]@{
+            zone   = $dnsZone
+            zoneId = $state.zone.id
+            link   = $state.link.name
+            state  = $state.link.provisioningState
+        }
+    }
+    return [pscustomobject]@{ resourceGroup = $DnsResourceGroup; zones = $states; state = 'linked' }
+}
+
+function Ensure-StoragePrivateEndpointDns {
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$EndpointResourceGroup,
+        [Parameter(Mandatory)][string]$EndpointName,
+        [Parameter(Mandatory)][string]$DnsResourceGroup,
+        [Parameter(Mandatory)][string]$VNetId,
+        [string]$DnsZone = 'privatelink.blob.core.windows.net'
+    )
+
+    $dnsState = Ensure-PrivateDnsZoneLink -SubscriptionId $SubscriptionId -DnsResourceGroup $DnsResourceGroup `
+        -VNetId $VNetId -DnsZone $DnsZone -LinkName "$EndpointName-blob-link"
+    $zone = $dnsState.zone
+    $link = @($dnsState.link)
+
+    $zoneGroupName = 'blob-zone-group'
+    $zoneGroup = Get-AzJson -Args @('network', 'private-endpoint', 'dns-zone-group', 'show', '--subscription', $SubscriptionId, '-g', $EndpointResourceGroup, '--endpoint-name', $EndpointName, '-n', $zoneGroupName) -AllowFail
+    $zoneGroupMatches = $zoneGroup -and
+        $zoneGroup.provisioningState -eq 'Succeeded' -and
+        @($zoneGroup.privateDnsZoneConfigs | Where-Object { $_.privateDnsZoneId -eq $zone.id }).Count -gt 0
+    if (-not $zoneGroupMatches) {
+        Invoke-Az -Args @('network', 'private-endpoint', 'dns-zone-group', 'create', '--subscription', $SubscriptionId, '-g', $EndpointResourceGroup, '--endpoint-name', $EndpointName, '-n', $zoneGroupName, '--private-dns-zone', $zone.id, '--zone-name', 'blob') | Out-Null
+        $zoneGroup = Get-AzJson -Args @('network', 'private-endpoint', 'dns-zone-group', 'show', '--subscription', $SubscriptionId, '-g', $EndpointResourceGroup, '--endpoint-name', $EndpointName, '-n', $zoneGroupName) -AllowFail
+        $zoneGroupMatches = $zoneGroup -and
+            $zoneGroup.provisioningState -eq 'Succeeded' -and
+            @($zoneGroup.privateDnsZoneConfigs | Where-Object { $_.privateDnsZoneId -eq $zone.id }).Count -gt 0
+    }
+    if (-not $zoneGroupMatches) {
+        $state = if ($zoneGroup) { [string]$zoneGroup.provisioningState } else { 'NotFound' }
+        throw "Private endpoint '$EndpointName' does not have a succeeded DNS zone group associated with '$($zone.id)' (state=$state)."
+    }
+
+    return [pscustomobject]@{
+        dnsZoneResourceGroup = $DnsResourceGroup
+        dnsZoneId            = $zone.id
+        vnetLink             = $link[0].name
+        dnsZoneGroup         = $zoneGroup.name
+        state                = 'linked'
+    }
 }
 
 function Invoke-ByoStorage {
@@ -563,6 +868,8 @@ if (-not $cfg.storage -or $cfg.storage.model -ne 'byo') {
 }
 else {
     $networkRg = Get-ConfigValue $cfg.network @('networkResourceGroup', 'resourceGroup', 'rg')
+    $dnsRg = Get-ConfigValue $cfg.network @('dnsResourceGroup')
+    if (-not $dnsRg) { $dnsRg = $networkRg }
     $storageRg = Get-ConfigValue $cfg.storage @('resourceGroup', 'resourceGroupName')
     if (-not $storageRg) { $storageRg = Get-StorageResourceGroupFromId }
     if (-not $storageRg) { $storageRg = $networkRg }
@@ -575,21 +882,63 @@ else {
 
     if (-not $account) {
         $results.Add((New-CheckResult -Id 'byo-storage-account-name' -Name 'BYO storage account name' -Status 'Fail' -Fr 'FR2.6' `
-                    -Detail 'config.storage.account/accountId is missing.' -Remediation 'Set config.storage.accountId (full resource id, as Stage 1 emits) or config.storage.account to the customer-owned storage account.'))
+                    -Detail 'No storage account is set (storage.account is empty).' `
+                    -Remediation "Set storage.account (the storage.account cell in the planning form) to the name of an existing StorageV2 account (the tool does not create it; create one with: az storage account create -g <rg> -n <globally-unique-name> -l $($cfg.workloadRegion) --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false). Re-run Stage 1 to regenerate config.json, then re-run Stage 2."))
     }
     else {
         try {
             Assert-AzLogin -SubscriptionId $cfg.subscriptionId
-            Invoke-Az -Args @('group', 'create', '--name', $storageRg, '--location', $cfg.workloadRegion) | Out-Null
-            $st = Get-AzJson -Args @('storage', 'account', 'show', '-g', $storageRg, '-n', $account) -AllowFail
+            # Strict BYO: the customer pre-creates the account; Stage 2 only configures it.
+            $stId = Get-StorageAccountId
+            $st = if ($stId) { Get-AzJson -Args @('storage', 'account', 'show', '--ids', $stId) -AllowFail }
+            else { Get-AzJson -Args @('storage', 'account', 'show', '-n', $account, '--subscription', $cfg.subscriptionId) -AllowFail }
             if (-not $st) {
-                Invoke-Az -Args @('storage', 'account', 'create', '-g', $storageRg, '-n', $account, '-l', $cfg.workloadRegion, '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--https-only', 'true', '--min-tls-version', 'TLS1_2', '--allow-blob-public-access', 'false') | Out-Null
-                $state = 'created'
+                $results.Add((New-CheckResult -Id 'byo-storage-account' -Name "BYO storage account $account" -Status 'Fail' -Fr 'FR2.6' `
+                            -Detail "Storage account '$(if ($stId) { $stId } else { $account })' was not found in subscription $($cfg.subscriptionId). The tool does not create it." `
+                            -Remediation 'Pre-create a StorageV2 account in the target subscription and set storage.account (the storage.account cell in the planning form) to its name. Re-run Stage 1 to regenerate config.json, then re-run Stage 2.'))
+                return $results.ToArray()
             }
-            else { $state = 'exists' }
+            if ($st.id -match '/resourceGroups/([^/]+)') { $storageRg = $Matches[1] }
+            $state = 'exists'
 
             $defaultAction = ($access -eq 'serviceEndpoint') ? 'Deny' : 'Deny'
             Invoke-Az -Args @('storage', 'account', 'update', '-g', $storageRg, '-n', $account, '--allow-blob-public-access', 'false', '--default-action', $defaultAction) | Out-Null
+
+            $corsMethods = @('GET', 'HEAD', 'DELETE', 'OPTIONS', 'PUT')
+            $corsOrigins = @('https://studio.discovery.microsoft.com', 'https://vscode.dev', 'https://*.vscode-cdn.net')
+            $blobServiceUrl = "https://management.azure.com$($st.id)/blobServices/default?api-version=2023-05-01"
+            $existingBlobService = Get-AzJson -Args @('rest', '--method', 'get', '--url', $blobServiceUrl) -AllowFail
+            $preservedCorsRules = @($existingBlobService.properties.cors.corsRules | Where-Object {
+                    @($_.allowedOrigins | Where-Object { $_ -in $corsOrigins }).Count -eq 0
+                })
+            $requiredCorsRule = @{
+                allowedOrigins  = $corsOrigins
+                allowedMethods  = $corsMethods
+                allowedHeaders  = @('*')
+                exposedHeaders  = @('*')
+                maxAgeInSeconds = 200
+            }
+            # blobServices/default accepts PUT only (PATCH returns 404). PUT replaces the service
+            # properties, so start from the current ones and swap in the CORS rules.
+            $blobProps = if ($existingBlobService -and $existingBlobService.properties) { $existingBlobService.properties } else { [pscustomobject]@{} }
+            $blobProps | Add-Member -NotePropertyName cors -NotePropertyValue @{ corsRules = @($preservedCorsRules) + @($requiredCorsRule) } -Force
+            $corsBodyFile = New-TemporaryFile
+            try {
+                @{ properties = $blobProps } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $corsBodyFile.FullName -Encoding utf8
+                Invoke-Az -Args @('rest', '--method', 'put', '--url', $blobServiceUrl, '--body', "@$($corsBodyFile.FullName)", '--headers', 'Content-Type=application/json') | Out-Null
+            }
+            finally { Remove-Item -LiteralPath $corsBodyFile.FullName -Force -ErrorAction SilentlyContinue }
+            $blobService = Get-AzJson -Args @('rest', '--method', 'get', '--url', $blobServiceUrl) -AllowFail
+            $corsRule = $blobService.properties.cors.corsRules | Where-Object {
+                $rule = $_
+                @($corsOrigins | Where-Object { $_ -notin @($rule.allowedOrigins) }).Count -eq 0
+            } | Select-Object -First 1
+            $corsOk = $corsRule -and
+                @($corsOrigins | Where-Object { $_ -notin @($corsRule.allowedOrigins) }).Count -eq 0 -and
+                @($corsMethods | Where-Object { $_ -notin @($corsRule.allowedMethods) }).Count -eq 0 -and
+                @($corsRule.allowedHeaders) -contains '*' -and
+                @($corsRule.exposedHeaders) -contains '*' -and
+                [int]$corsRule.maxAgeInSeconds -eq 200
 
             $containerStates = @()
             $containerFailures = @()
@@ -597,9 +946,10 @@ else {
             $peFailures = @()
             foreach ($container in $containers) {
                 $cname = [string]$container
-                $existsBefore = Get-AzJson -Args @('storage', 'container', 'exists', '--account-name', $account, '--name', $cname, '--auth-mode', 'login') -AllowFail
-                Invoke-Az -Args @('storage', 'container', 'create', '--account-name', $account, '--name', $cname, '--auth-mode', 'login') -AllowFail | Out-Null
-                $existsAfter = Get-AzJson -Args @('storage', 'container', 'exists', '--account-name', $account, '--name', $cname, '--auth-mode', 'login') -AllowFail
+                # Use the ARM control plane: the account firewall (default-action Deny) blocks data-plane calls.
+                $existsBefore = Get-AzJson -Args @('storage', 'container-rm', 'exists', '--storage-account', $account, '-g', $storageRg, '-n', $cname) -AllowFail
+                Invoke-Az -Args @('storage', 'container-rm', 'create', '--storage-account', $account, '-g', $storageRg, '-n', $cname, '--public-access', 'off') -AllowFail | Out-Null
+                $existsAfter = Get-AzJson -Args @('storage', 'container-rm', 'exists', '--storage-account', $account, '-g', $storageRg, '-n', $cname) -AllowFail
                 if ($existsAfter -and $existsAfter.exists) {
                     $cstate = if ($existsBefore -and $existsBefore.exists) { 'exists' } else { 'created' }
                 }
@@ -625,7 +975,7 @@ else {
                 $accessData.vnet = $vnet
             }
             elseif ($access -eq 'privateEndpoint') {
-                $peSubnet = @($cfg.network.subnets | Where-Object { (Resolve-SubnetRole $_.role) -eq 'private-endpoints' } | Select-Object -First 1)
+                $peSubnet = $cfg.network.subnets | Where-Object { (Resolve-SubnetRole $_.role) -eq 'private-endpoints' } | Select-Object -First 1
                 if ($peSubnet) {
                     $vnet = Get-VNetName
                     $subnetName = Get-SubnetName $peSubnet
@@ -639,29 +989,21 @@ else {
                     }
                     else { $peState = 'exists' }
 
-                    # Create + verify the private DNS zone group so blob FQDNs resolve to the PE.
-                    $dnsZone = 'privatelink.blob.core.windows.net'
-                    $zoneObj = Get-AzJson -Args @('network', 'private-dns', 'zone', 'show', '-g', $storageRg, '-n', $dnsZone) -AllowFail
-                    if (-not $zoneObj) {
-                        Invoke-Az -Args @('network', 'private-dns', 'zone', 'create', '-g', $storageRg, '-n', $dnsZone) -AllowFail | Out-Null
-                        $zoneObj = Get-AzJson -Args @('network', 'private-dns', 'zone', 'show', '-g', $storageRg, '-n', $dnsZone) -AllowFail
+                    # Reuse the canonical zone from the network/DNS resource group. A VNet cannot
+                    # link to duplicate private DNS zones with the same namespace.
+                    $vnetId = "/subscriptions/$($cfg.subscriptionId)/resourceGroups/$networkRg/providers/Microsoft.Network/virtualNetworks/$vnet"
+                    $dnsState = Ensure-StoragePrivateEndpointDns -SubscriptionId $cfg.subscriptionId `
+                        -EndpointResourceGroup $storageRg -EndpointName $peName `
+                        -DnsResourceGroup $dnsRg -VNetId $vnetId
+                    $accessData.privateEndpoint = @{
+                        name                 = $peName
+                        state                = $peState
+                        subnetId             = $subnetId
+                        dnsZone              = 'privatelink.blob.core.windows.net'
+                        dnsZoneResourceGroup = $dnsState.dnsZoneResourceGroup
+                        dnsZoneGroup         = $dnsState.state
+                        vnetLink             = $dnsState.vnetLink
                     }
-                    $zoneId = if ($zoneObj -and $zoneObj.id) { $zoneObj.id } else { "/subscriptions/$($cfg.subscriptionId)/resourceGroups/$storageRg/providers/Microsoft.Network/privateDnsZones/$dnsZone" }
-                    $linkName = "$account-blob-link"
-                    $link = Get-AzJson -Args @('network', 'private-dns', 'link', 'vnet', 'show', '-g', $storageRg, '-n', $linkName, '--zone-name', $dnsZone) -AllowFail
-                    if (-not $link) {
-                        $vnetId = "/subscriptions/$($cfg.subscriptionId)/resourceGroups/$networkRg/providers/Microsoft.Network/virtualNetworks/$vnet"
-                        Invoke-Az -Args @('network', 'private-dns', 'link', 'vnet', 'create', '-g', $storageRg, '-n', $linkName, '--zone-name', $dnsZone, '--virtual-network', $vnetId, '--registration-enabled', 'false') -AllowFail | Out-Null
-                    }
-                    $zgName = 'blob-zone-group'
-                    $zg = Get-AzJson -Args @('network', 'private-endpoint', 'dns-zone-group', 'show', '-g', $storageRg, '--endpoint-name', $peName, '-n', $zgName) -AllowFail
-                    if (-not $zg) {
-                        Invoke-Az -Args @('network', 'private-endpoint', 'dns-zone-group', 'create', '-g', $storageRg, '--endpoint-name', $peName, '-n', $zgName, '--private-dns-zone', $zoneId, '--zone-name', 'blob') -AllowFail | Out-Null
-                        $zg = Get-AzJson -Args @('network', 'private-endpoint', 'dns-zone-group', 'show', '-g', $storageRg, '--endpoint-name', $peName, '-n', $zgName) -AllowFail
-                    }
-                    $dnsZoneGroupState = if ($zg) { 'linked' } else { 'failed' }
-                    if ($dnsZoneGroupState -eq 'failed') { $peFailures += "$peName (dns-zone-group)" }
-                    $accessData.privateEndpoint = @{ name = $peName; state = $peState; subnetId = $subnetId; dnsZone = $dnsZone; dnsZoneGroup = $dnsZoneGroupState }
                 }
                 else {
                     $results.Add((New-CheckResult -Id 'byo-storage-pe-subnet' -Name 'BYO storage private endpoint subnet' -Status 'Warn' -Fr 'FR2.6' `
@@ -672,6 +1014,7 @@ else {
 
             $st = Get-AzJson -Args @('storage', 'account', 'show', '-g', $storageRg, '-n', $account)
             $failParts = @()
+            if (-not $corsOk) { $failParts += 'cors-verification-failed' }
             if ($containerFailures.Count) { $failParts += "containers-failed=$($containerFailures -join ',')" }
             if ($ruleFailures.Count) { $failParts += "network-rules-failed=$($ruleFailures -join ',')" }
             if ($peFailures.Count) { $failParts += "pe-failed=$($peFailures -join ',')" }
@@ -680,8 +1023,8 @@ else {
             if ($failParts.Count) { $storageDetail += " | " + ($failParts -join '; ') }
             $results.Add((New-CheckResult -Id 'byo-storage-account' -Name "BYO storage account $account" -Status $storageStatus -Fr 'FR2.6' `
                         -Detail $storageDetail `
-                        -Remediation $(if ($failParts.Count) { 'One or more containers, network rules, or the private DNS zone group could not be verified. Check RBAC (Storage/Network Contributor) and rerun.' } else { $null }) `
-                        -Data @{ id = $st.id; resourceGroup = $storageRg; account = $account; state = $state; containers = $containerStates; access = $accessData }))
+                        -Remediation $(if ($failParts.Count) { 'The required CORS rule, one or more containers, network rules, or the private DNS zone group could not be verified. Check RBAC (Storage/Network Contributor) and rerun.' } else { $null }) `
+                        -Data @{ id = $st.id; resourceGroup = $storageRg; account = $account; state = $state; containers = $containerStates; access = $accessData; cors = @{ configured = $corsOk; origins = $corsOrigins; methods = $corsMethods; maxAgeInSeconds = 200 } }))
         }
         catch {
             $results.Add((New-CheckResult -Id 'byo-storage-account' -Name "BYO storage account $account" -Status 'Fail' -Fr 'FR2.6' `
@@ -691,6 +1034,76 @@ else {
     }
 }
 
+    return $results.ToArray()
+}
+
+function Invoke-ManagedIdentityRoles {
+    # Grants the workspace/supercomputer UAMI the roles Stage 4 verifies (FR4.1). Runs after
+    # network and storage provisioning so the network resource group and VNet exist.
+    param(
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [switch]$PassThru,
+        [string]$JsonPath
+    )
+    $cfg = $Config
+    $results = [System.Collections.Generic.List[object]]::new()
+    function Get-ConfigValue {
+        param([object]$Object, [string[]]$Names)
+        if (-not $Object) { return $null }
+        foreach ($name in $Names) {
+            if ($Object.PSObject.Properties.Name -contains $name -and $Object.$name) { return $Object.$name }
+        }
+        return $null
+    }
+    $uamiId = $null
+    foreach ($c in @('managedIdentity', 'workspaceIdentity', 'identity')) {
+        if ($cfg.PSObject.Properties.Name -contains $c -and $cfg.$c -and $cfg.$c.PSObject.Properties.Name -contains 'id' -and $cfg.$c.id) { $uamiId = [string]$cfg.$c.id; break }
+    }
+    if (-not $uamiId) {
+        $results.Add((New-CheckResult -Id 'uami-roles' -Name 'managed identity role assignments' -Status 'Skip' -Fr 'FR2.1' `
+                    -Detail 'Config has no managedIdentity.id, so there is no identity to grant roles to. Stage 4 fails until one is set.' `
+                    -Remediation 'Create a user-assigned managed identity, set managedIdentity.id in the config, and rerun Stage 2.'))
+        return $results.ToArray()
+    }
+    $uami = Get-AzJson -Args @('identity', 'show', '--ids', $uamiId) -AllowFail
+    if (-not $uami -or -not $uami.principalId) {
+        $results.Add((New-CheckResult -Id 'uami-roles' -Name 'managed identity role assignments' -Status 'Warn' -Fr 'FR2.1' `
+                    -Detail "managedIdentity.id does not resolve to an existing identity: $uamiId. No roles were assigned." `
+                    -Remediation 'Create the identity (az identity create) or correct managedIdentity.id, then rerun Stage 2 before Stage 4.'))
+        return $results.ToArray()
+    }
+
+    $sub = $cfg.subscriptionId
+    $rg = [string]$cfg.resourceGroup
+    $rgScope = "/subscriptions/$sub/resourceGroups/$rg"
+    $grants = [System.Collections.Generic.List[object]]::new()
+    $grants.Add(@('Microsoft Discovery Platform Contributor', '01288891-85ee-45a7-b367-9db3b752fc65', $rgScope, $rg))
+    $grants.Add(@('Storage Blob Data Contributor', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe', $rgScope, $rg))
+    $grants.Add(@('AcrPull', '7f951dda-4ed3-4680-a7ca-43fe172d538d', $rgScope, $rg))
+
+    # Network Contributor on the VNet covers the supercomputer subnets Stage 4 checks.
+    $netRg = Get-ConfigValue $cfg.network @('networkResourceGroup', 'resourceGroup', 'rg')
+    $vnet = Get-ConfigValue $cfg.network @('vnetName', 'name')
+    if ($netRg) {
+        $netScope = "/subscriptions/$sub/resourceGroups/$netRg"
+        $netLabel = $netRg
+        if ($vnet) {
+            $vnetObj = Get-AzJson -Args @('network', 'vnet', 'show', '-g', $netRg, '-n', $vnet) -AllowFail
+            if ($vnetObj -and $vnetObj.id) { $netScope = [string]$vnetObj.id; $netLabel = $vnet }
+        }
+        $grants.Add(@('Network Contributor', '4d97b98b-1d4f-4787-a291-c67834d212e7', $netScope, $netLabel))
+    }
+    else {
+        $results.Add((New-CheckResult -Id 'uami-roles-network' -Name 'managed identity Network Contributor' -Status 'Warn' -Fr 'FR2.1' `
+                    -Detail 'Config has no network.networkResourceGroup, so Network Contributor was not assigned to the managed identity.' `
+                    -Remediation 'Assign Network Contributor to the managed identity on the VNet that hosts the supercomputer subnets before Stage 4.'))
+    }
+
+    foreach ($g in $grants) {
+        $results.Add((Grant-OnboardingRole -PrincipalId $uami.principalId -PrincipalType 'ServicePrincipal' `
+                    -RoleName $g[0] -RoleId $g[1] -Scope $g[2] -ScopeLabel $g[3] -IdPrefix 'uami'))
+    }
     return $results.ToArray()
 }
 
@@ -1017,6 +1430,39 @@ catch {
     return $results.ToArray()
 }
 
+function Invoke-Stage2Pipeline {
+    param(
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Results,
+        [Parameter(Mandatory)][object[]]$Steps,
+        [string]$JsonPath
+    )
+
+    foreach ($step in $Steps) {
+        $scriptName = $step.ScriptName
+        if ($Results | Where-Object { $_.status -eq 'Fail' }) { break }
+        try {
+            $functionName = $step.FunctionName
+            $stepResults = & $functionName -Config $Config -ConfigPath $ConfigPath -PassThru -JsonPath $JsonPath
+            foreach ($r in @($stepResults)) { $Results.Add($r) }
+            $fail = @($stepResults | Where-Object { $_.status -eq 'Fail' } | Select-Object -First 1)
+            if ($fail.Count -gt 0) {
+                $Results.Add((New-CheckResult -Id "stage2-stop-$scriptName" -Name "stopped after $scriptName" -Status 'Fail' -Fr 'FR2.9' `
+                            -Detail "First hard failure: $($fail[0].name) — $($fail[0].detail)" `
+                            -Remediation $fail[0].remediation))
+                break
+            }
+        }
+        catch {
+            $Results.Add((New-CheckResult -Id "stage2-exception-$scriptName" -Name "sub-script $scriptName" -Status 'Fail' -Fr 'FR2.9' `
+                        -Detail $_.Exception.Message -Remediation "Fix the error in $scriptName and rerun Stage 2; scripts are idempotent."))
+            break
+        }
+    }
+    return $Results.ToArray()
+}
+
 $cfg = Get-OnboardingConfig -Path $ConfigPath
 $results = [System.Collections.Generic.List[object]]::new()
 $steps = @(
@@ -1025,6 +1471,7 @@ $steps = @(
     [pscustomobject]@{ ScriptName = 'nsp_perimeter_joiner_role.ps1'; FunctionName = 'Invoke-NspPerimeterJoinerRole' },
     [pscustomobject]@{ ScriptName = 'network_provision.ps1'; FunctionName = 'Invoke-NetworkProvision' },
     [pscustomobject]@{ ScriptName = 'byo_storage.ps1'; FunctionName = 'Invoke-ByoStorage' },
+    [pscustomobject]@{ ScriptName = 'managed_identity_roles.ps1'; FunctionName = 'Invoke-ManagedIdentityRoles' },
     [pscustomobject]@{ ScriptName = 'firewall_request_artifact.ps1'; FunctionName = 'Invoke-FirewallRequestArtifact' },
     [pscustomobject]@{ ScriptName = 'quota_exemption_requests.ps1'; FunctionName = 'Invoke-QuotaExemptionRequests' }
 )
@@ -1037,29 +1484,8 @@ catch {
                 -Detail $_.Exception.Message -Remediation "Run 'az login' and ensure access to subscription $($cfg.subscriptionId)."))
 }
 
-foreach ($step in $steps) {
-    $scriptName = $step.ScriptName
-    if ($results | Where-Object { $_.status -eq 'Fail' }) { break }
-    try {
-        $functionName = $step.FunctionName
-        $stepResults = & $functionName -Config $cfg -ConfigPath $ConfigPath -PassThru -JsonPath $JsonPath
-        foreach ($r in @($stepResults)) { $results.Add($r) }
-        $fail = @($stepResults | Where-Object { $_.status -eq 'Fail' } | Select-Object -First 1)
-        if ($fail.Count -gt 0) {
-            $results.Add((New-CheckResult -Id "stage2-stop-$scriptName" -Name "stopped after $scriptName" -Status 'Fail' -Fr 'FR2.9' `
-                        -Detail "First hard failure: $($fail[0].name) — $($fail[0].detail)" `
-                        -Remediation $fail[0].remediation))
-            break
-        }
-    }
-    catch {
-        $results.Add((New-CheckResult -Id "stage2-exception-$scriptName" -Name "sub-script $scriptName" -Status 'Fail' -Fr 'FR2.9' `
-                    -Detail $_.Exception.Message -Remediation "Fix the error in $scriptName and rerun Stage 2; scripts are idempotent."))
-        break
-    }
-}
+$null = Invoke-Stage2Pipeline -Config $cfg -ConfigPath $ConfigPath -Results $results -Steps $steps -JsonPath $JsonPath
 
 if ($PassThru) { return $results.ToArray() }
 $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 2 · landing-zone preparation (FR2.1-FR2.9)' -JsonPath $JsonPath
 Complete-Stage -Results $results.ToArray()
-

@@ -1,15 +1,15 @@
 // Stage 4 — Discovery platform baseline template.
 // Deploys the platform in one RG-scoped deployment: supercomputer (+ node pool),
-// bookshelf storage container, workspace, validation chat model, and project.
+// project storage container, workspace, validation chat model, and project.
 // Parameters are generated from the Stage 1 config by stage4_deploy.ps1
 // (New-Stage4BicepParamFile); do not hand-edit values — change config.json and re-run.
 
 targetScope = 'resourceGroup'
 
-@description('Region for all Discovery resources. Must equal the BYO VNet/subnet region.')
+@description('Control-plane region for Discovery resources. Can differ from the VNet/subnet and managed-resource-group region.')
 param location string
 
-@description('workloadRegion tag (discovery.overridemrgregion) for the managed RGs.')
+@description('Region for all managed-resource-group resources, set through discovery.overridemrgregion. Must match the VNet/subnet region.')
 param workloadRegion string = location
 
 param supercomputerName string
@@ -36,11 +36,8 @@ param workspaceSubnetId string
 @description('private-endpoints-role subnet id.')
 param privateEndpointSubnetId string
 
-@description('Storage account id backing the bookshelf container.')
+@description('Storage account id backing the project storage container.')
 param storageAccountId string = ''
-@description('Whether the bookshelf storage container is in scope.')
-param bookshelfInScope bool = true
-
 @description('AKS egress model, decided at planning (Stage 1). UserDefinedRouting = forced tunneling via the customer firewall/NVA; LoadBalancer = Azure-managed egress.')
 @allowed([
   'UserDefinedRouting'
@@ -53,7 +50,12 @@ param nodePoolVmSize string = 'Standard_D4ds_v6'
 param nodePoolMinNodeCount int = 0
 param nodePoolMaxNodeCount int = 3
 param nodePoolScaleSetPriority string = 'Regular'
-param publicNetworkAccess string = 'Disabled'
+@allowed([
+  'Enabled'
+  'Disabled'
+])
+param publicNetworkAccess string = 'Enabled'
+param networkIsolation bool = true
 
 #disable-next-line BCP081
 resource supercomputer 'Microsoft.Discovery/supercomputers@2026-06-01' = {
@@ -93,7 +95,7 @@ resource nodePool 'Microsoft.Discovery/supercomputers/nodePools@2026-06-01' = {
 }
 
 #disable-next-line BCP081
-resource storageContainer 'Microsoft.Discovery/storageContainers@2026-06-01' = if (bookshelfInScope && !empty(storageAccountId)) {
+resource storageContainer 'Microsoft.Discovery/storageContainers@2026-06-01' = {
   name: storageContainerName
   location: location
   properties: {
@@ -113,7 +115,7 @@ resource workspace 'Microsoft.Discovery/workspaces@2026-06-01' = {
     'discovery.workbench.enableGhcpAiFeatures': 'true'
     'discovery.workbench.enableExtensions': 'true'
     'discovery.overridemrgregion': workloadRegion
-    NetworkIsolation: 'true'
+    NetworkIsolation: string(networkIsolation)
     SkipAssociateKeyVaultToNsp: 'true'
     SkipAssociateCosmosDBToNsp: 'true'
     SkipAssociateStorageAccountsToNsp: 'true'
@@ -146,7 +148,7 @@ resource project 'Microsoft.Discovery/workspaces/projects@2026-06-01' = {
   name: projectName
   location: location
   properties: {
-    storageContainerIds: (bookshelfInScope && !empty(storageAccountId)) ? [ storageContainer.id ] : []
+    storageContainerIds: [ storageContainer.id ]
   }
   dependsOn: [ chatModel ]
 }

@@ -1,12 +1,26 @@
+#!/usr/bin/env pwsh
 #Requires -Version 7.0
+
 <#
-.SYNOPSIS  Stage 5 / FR5.3-FR5.7 — run agent Q&A certification end to end.
-.DESCRIPTION Orchestrates agent creation (no tool), investigation/conversation, prompt polling, response verification, and summary. Spec: ../../script-specs/stage5-scenario-enablement/stage5_enable.md
+.SYNOPSIS
+    Stage 5 / FR5.3-FR5.7 — run agent Q&A certification end to end.
+.DESCRIPTION
+    Orchestrates agent creation (no tool), investigation/conversation, prompt polling,
+    response verification, and summary.
+.PARAMETER DryRun
+    List intended actions offline without Azure calls, inference or state artifacts.
+    Reports use PLAN, never certification. PassThru returns objects without reports.
+.PARAMETER PassThru
+    Return result objects instead of writing the final report or invoking the exit gate.
+.LINK
+    ../../script-specs/stage5-scenario-enablement/stage5_enable.md
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ConfigPath,
     [string]$JsonPath,
+    [switch]$DryRun,
+    [switch]$PassThru,
     [string]$ResourceGroup,
     [string]$Workspace,
     [string]$Project,
@@ -14,6 +28,10 @@ param(
     [string]$Prompt
 )
 Import-Module (Join-Path $PSScriptRoot '..\lib\OnboardingCommon.psm1') -Force
+if ($DryRun) {
+    Write-OnboardingPlan -Stage 5 -ConfigPath $ConfigPath -Options $PSBoundParameters -JsonPath $JsonPath -PassThru:$PassThru -ErrorAction Stop
+    return
+}
 
 function Get-CfgString { param([object]$Object, [string]$Name, [string]$Default = '') if ($Object -and $Object.PSObject.Properties.Name -contains $Name -and $Object.$Name) { [string]$Object.$Name } else { $Default } }
 function Add-Many { param([object[]]$Items) foreach ($i in @($Items)) { $results.Add($i) } }
@@ -29,6 +47,88 @@ function Write-State {
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     [pscustomobject]$State | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path -Encoding utf8
+}
+
+function Get-Stage5VNetId {
+    param(
+        [Parameter(Mandatory)][object]$Config,
+        [Parameter(Mandatory)][string]$DefaultResourceGroup,
+        [Parameter(Mandatory)][string]$DefaultWorkspace
+    )
+
+    $networkResourceGroup = Get-CfgString $Config.network 'networkResourceGroup' (
+        Get-CfgString $Config.network 'resourceGroup' (
+            Get-CfgString $Config.network 'rg' $DefaultResourceGroup
+        )
+    )
+    $vnetName = Get-CfgString $Config.network 'vnetName' (
+        Get-CfgString $Config.network 'virtualNetworkName' (
+            Get-CfgString $Config.names 'vnet' (
+                Get-CfgString $Config.names 'virtualNetwork' "vnet-$DefaultWorkspace"
+            )
+        )
+    )
+    return "/subscriptions/$($Config.subscriptionId)/resourceGroups/$networkResourceGroup/providers/Microsoft.Network/virtualNetworks/$vnetName"
+}
+
+function Test-StorageBlobPrivateLinkConnection {
+    param(
+        [Parameter(Mandatory)][object]$Connection,
+        [Parameter(Mandatory)][string]$StorageAccountName
+    )
+
+    $targetsAccount = $Connection.privateLinkServiceId -and
+        "$($Connection.privateLinkServiceId)" -match "/storageAccounts/$([regex]::Escape($StorageAccountName))$"
+    $targetsBlob = @($Connection.groupIds) -contains 'blob'
+    return $targetsAccount -and $targetsBlob
+}
+
+function Test-StoragePrivateEndpointDns {
+    param(
+        [Parameter(Mandatory)][object]$PrivateEndpoint,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$VNetId
+    )
+
+    $zoneGroups = @(Get-AzJson -Args @(
+            'network', 'private-endpoint', 'dns-zone-group', 'list',
+            '-g', $ResourceGroup, '--endpoint-name', [string]$PrivateEndpoint.name
+        ) -AllowFail)
+    $blobZoneIds = @(
+        foreach ($group in $zoneGroups) {
+            if ($group.provisioningState -ne 'Succeeded') { continue }
+            foreach ($config in @($group.privateDnsZoneConfigs)) {
+                if ($config.privateDnsZoneId -match '/privateDnsZones/privatelink\.blob\.core\.windows\.net$') {
+                    [string]$config.privateDnsZoneId
+                }
+            }
+        }
+    )
+
+    $linkedZoneIds = @(
+        foreach ($zoneId in $blobZoneIds | Sort-Object -Unique) {
+            if ($zoneId -notmatch '/resourceGroups/([^/]+)/providers/Microsoft\.Network/privateDnsZones/([^/]+)$') { continue }
+            $zoneResourceGroup = $Matches[1]
+            $zoneName = $Matches[2]
+            $links = @(Get-AzJson -Args @(
+                    'network', 'private-dns', 'link', 'vnet', 'list',
+                    '-g', $zoneResourceGroup, '-z', $zoneName
+                ) -AllowFail)
+            $matchingLinks = @($links | Where-Object {
+                    $_.virtualNetwork.id -and
+                    $_.virtualNetwork.id -eq $VNetId -and
+                    $_.provisioningState -eq 'Succeeded'
+                })
+            if ($matchingLinks.Count) { $zoneId }
+        }
+    )
+
+    return [pscustomobject]@{
+        zoneGroupConfigured = $blobZoneIds.Count -gt 0
+        vnetLinked          = $linkedZoneIds.Count -gt 0
+        blobZoneIds         = $blobZoneIds
+        linkedZoneIds       = $linkedZoneIds
+    }
 }
 
 <#
@@ -95,7 +195,7 @@ function Invoke-Stage5CreateAgent {
             }
         }
         $url = "$base/projects/$Project`:upsertAgent?api-version=$api"
-        $upsert = Invoke-DiscoveryJson -Method 'PUT' -Uri $url -Body $body -ReturnHeaders
+        $upsert = Invoke-DiscoveryJson -Method 'POST' -Uri $url -Body $body -ReturnHeaders
         $op = @($upsert.Headers['Operation-Location'] + $upsert.Headers['operation-location'] + $upsert.Headers['Azure-AsyncOperation'] + $upsert.Headers['azure-asyncoperation'] | Where-Object { $_ } | Select-Object -First 1)
         $opStatus = ''
         if ($op) {
@@ -156,10 +256,19 @@ function Invoke-Stage5CreateInvestigationConversation {
         $invOk = $inv.StatusCode -in @(200, 201, 202)
         Add-Result 'fr5-4-investigation' 'investigation created' ($invOk ? 'Pass' : 'Fail') "investigationName=$invPath statusCode=$($inv.StatusCode)" ($invOk ? '' : 'Create the investigation before creating the conversation.')
         if ($invOk) {
-            $conv = Invoke-DiscoveryJson -Method 'POST' -Uri "$base/conversations?api-version=$api" -Body @{ displayName = 'stage5-hero-conversation'; investigationName = $invPath; projectName = $Project }
+            # A just-created investigation can return 5xx for a few seconds; retry before failing.
+            $conv = $null
+            for ($i = 0; $i -lt 6; $i++) {
+                $conv = Invoke-DiscoveryJson -Method 'POST' -Uri "$base/conversations?api-version=$api" -Body @{ displayName = 'stage5-hero-conversation'; investigationName = $invPath; projectName = $Project }
+                if ($conv.StatusCode -lt 500) { break }
+                Start-Sleep -Seconds 10
+            }
             $convId = if ($conv.Body -and $conv.Body.name) { [string]$conv.Body.name } elseif ($conv.Body -and $conv.Body.id) { [string]$conv.Body.id } else { '' }
             $ok = $conv.StatusCode -in @(200, 201, 202) -and $convId
-            Add-Result 'fr5-4-conversation' 'conversation created' ($ok ? 'Pass' : 'Fail') "conversationId=$convId statusCode=$($conv.StatusCode)" ($ok ? '' : 'Use full investigationName path /projects/{project}/investigations/{investigation}.') ([pscustomobject]@{ investigationName = $invPath; conversationId = $convId; projectName = $Project })
+            $convDetail = "conversationId=$convId statusCode=$($conv.StatusCode) attempts=$($i + [int]($i -lt 6))"
+            if (-not $ok -and $conv.Body) { $b = ($conv.Body | ConvertTo-Json -Depth 5 -Compress); $convDetail += " body=$($b.Substring(0, [Math]::Min(300, $b.Length)))" }
+            $convFix = if ($conv.StatusCode -ge 500) { 'The service returned a server error after retries. Re-run Stage 5; if it persists, open a support case with the response body.' } else { 'Use full investigationName path /projects/{project}/investigations/{investigation}.' }
+            Add-Result 'fr5-4-conversation' 'conversation created' ($ok ? 'Pass' : 'Fail') $convDetail ($ok ? '' : $convFix) ([pscustomobject]@{ investigationName = $invPath; conversationId = $convId; projectName = $Project })
         }
     }
 
@@ -218,7 +327,7 @@ function Invoke-Stage5SendPromptPoll {
                 })
             agent = @{ type = 'agent_reference'; name = $Agent }
         }
-        $send = Invoke-DiscoveryJson -Method 'POST' -Uri "$base/conversations/$ConversationId/openai/responses" -Body $sendBody
+        $send = Invoke-DiscoveryJson -Method 'POST' -Uri "$base/conversations/$ConversationId/openai/v1/responses" -Body $sendBody
         $rid = if ($send.Body -and $send.Body.id) { [string]$send.Body.id } else { '' }
         $sent = $send.StatusCode -in @(200, 201, 202) -and $rid
         Add-Result 'fr5-5-response-started' 'agent response started' ($sent ? 'Pass' : 'Fail') "responseId=$rid statusCode=$($send.StatusCode)" ($sent ? '' : 'Send content as an array of parts and do not add api-version to the responses route.') ([pscustomobject]@{ responseId = $rid; conversationId = $ConversationId })
@@ -228,7 +337,7 @@ function Invoke-Stage5SendPromptPoll {
             $status = ''
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds $PollSeconds
-                $poll = Invoke-DiscoveryJson -Method 'GET' -Uri "$base/conversations/$ConversationId/openai/responses/$rid"
+                $poll = Invoke-DiscoveryJson -Method 'GET' -Uri "$base/conversations/$ConversationId/openai/v1/responses/$rid"
                 $final = $poll.Body
                 $status = if ($final -and $final.status) { [string]$final.status } else { '' }
                 if ($status -in @('completed', 'failed', 'cancelled', 'expired', 'incomplete')) { break }
@@ -265,6 +374,7 @@ function Invoke-Stage5AssertResponse {
     begin {
         $cfg = Get-OnboardingConfig -Path $ConfigPath
         $null = $cfg
+        $script:responseObject = $null
         $results = [System.Collections.Generic.List[object]]::new()
     }
     process {
@@ -359,26 +469,47 @@ function Invoke-Stage5VerificationSummary {
         }
     }
 
-    if ($cfg.PSObject.Properties.Name -contains 'bookshelf' -and $cfg.bookshelf -and $cfg.bookshelf.inScope) {
+    # Project storage: the BYO account behind the project's storage container. Required for every
+    # deployment (not just Bookshelf); Stage 2 creates its blob PE in the storage account's RG.
+    $stAccountId = Get-CfgString $cfg.storage 'accountId'
+    $stAccount = Get-CfgString $cfg.storage 'account'
+    if (-not $stAccount -and $stAccountId) { $stAccount = ($stAccountId -split '/')[-1] }
+    $stAccess = Get-CfgString $cfg.storage 'access' 'privateEndpoint'
+    if (-not $stAccount) {
+        Add-Result 'fr5-7-project-storage' 'project storage private endpoint' 'Fail' 'storage.account/accountId is not set in config.' 'Set storage.account (the storage.account cell in the planning form) and re-run Stages 1 and 2.'
+    }
+    elseif ($stAccess -ne 'privateEndpoint') {
+        Add-Result 'fr5-7-project-storage' 'project storage private endpoint' 'Skip' "storage.access=$stAccess; no private endpoint expected for storageAccount=$stAccount."
+    }
+    else {
+        $stRg = if ($stAccountId -match '/resourceGroups/([^/]+)') { $Matches[1] } else { Get-CfgString $cfg.storage 'resourceGroup' }
+        $vnetId = Get-Stage5VNetId -Config $cfg -DefaultResourceGroup $ResourceGroup -DefaultWorkspace $Workspace
         $approved = 0
-        $dns = 0
+        $succeeded = 0
+        $zoneGroups = 0
+        $vnetLinks = 0
         $qualified = 0
-        foreach ($rg in @($ResourceGroup, (Get-CfgString $cfg.network 'networkResourceGroup')) | Where-Object { $_ } | Sort-Object -Unique) {
+        $found = 0
+        foreach ($rg in @($stRg, $ResourceGroup, (Get-CfgString $cfg.network 'networkResourceGroup')) | Where-Object { $_ } | Sort-Object -Unique) {
             $pes = @(Get-AzJson -Args @('network', 'private-endpoint', 'list', '-g', $rg) -AllowFail)
             foreach ($pe in $pes) {
-                $isBookshelf = "$($pe.name) $($pe.id)" -match 'bookshelf|storage'
-                if (-not $isBookshelf) { continue }
-                $peApproved = @($pe.privateLinkServiceConnections | Where-Object { $_.privateLinkServiceConnectionState.status -eq 'Approved' }).Count -gt 0
-                $peDns = @($pe.customDnsConfigs).Count -gt 0
+                $conns = @(@($pe.privateLinkServiceConnections) + @($pe.manualPrivateLinkServiceConnections) | Where-Object {
+                        $_ -and (Test-StorageBlobPrivateLinkConnection -Connection $_ -StorageAccountName $stAccount)
+                    })
+                if (-not $conns.Count) { continue }
+                $found++
+                $peSucceeded = $pe.provisioningState -eq 'Succeeded'
+                $peApproved = @($conns | Where-Object { $_.privateLinkServiceConnectionState.status -eq 'Approved' }).Count -gt 0
+                $peDns = Test-StoragePrivateEndpointDns -PrivateEndpoint $pe -ResourceGroup $rg -VNetId $vnetId
+                if ($peSucceeded) { $succeeded++ }
                 if ($peApproved) { $approved++ }
-                if ($peDns) { $dns++ }
-                if ($peApproved -and $peDns) { $qualified++ }
+                if ($peDns.zoneGroupConfigured) { $zoneGroups++ }
+                if ($peDns.vnetLinked) { $vnetLinks++ }
+                if ($peSucceeded -and $peApproved -and $peDns.zoneGroupConfigured -and $peDns.vnetLinked) { $qualified++ }
             }
         }
-        $ok = $qualified -ge 3
-        Add-Result 'fr5-7-bookshelf' 'bookshelf private endpoints' ($ok ? 'Pass' : 'Fail') "qualified=$qualified approved=$approved dns=$dns expected=3" ($ok ? '' : 'Ensure at least three bookshelf private endpoints are each both Approved and have a non-empty custom DNS config.')
-    } else {
-        Add-Result 'fr5-7-bookshelf' 'bookshelf private endpoints' 'Skip' 'Bookshelf is out of scope for this config.'
+        $ok = $qualified -ge 1
+        Add-Result 'fr5-7-project-storage' 'project storage private endpoint' ($ok ? 'Pass' : 'Fail') "storageAccount=$stAccount privateEndpoints=$found succeeded=$succeeded approved=$approved dnsZoneGroups=$zoneGroups vnetLinks=$vnetLinks" ($ok ? '' : 'Re-run Stage 2 to create the project storage private endpoint, its blob private DNS zone group, and the zone link to the configured VNet; wait for provisioning to succeed and approve the connection if it is Pending.')
     }
 
     foreach ($item in @(
@@ -417,7 +548,20 @@ $state = @{
     investigationCreated = $false; conversationCompleted = $false; responseReceived = $false
 }
 
-$step = Invoke-Stage5CreateAgent -ConfigPath $ConfigPath -Workspace $Workspace -Project $Project -ChatModel $ChatModel -Agent $agentName -PassThru
+$wsArmId = "/subscriptions/$($cfg.subscriptionId)/resourceGroups/$ResourceGroup/providers/Microsoft.Discovery/workspaces/$Workspace"
+$pna = ([string](Invoke-Az -AllowFail -Args @('resource', 'show', '--ids', $wsArmId, '--api-version', '2026-06-01', '--query', 'properties.publicNetworkAccess', '-o', 'tsv'))).Trim()
+$probeCode = 0; $probeErr = ''
+try {
+    $tok = ([string](Invoke-Az -Args @('account', 'get-access-token', '--resource', 'https://discovery.azure.com', '--query', 'accessToken', '-o', 'tsv'))).Trim()
+    $probe = Invoke-WebRequest -Method GET -Uri "https://$Workspace.workspace.discovery.azure.com/projects/$Project/agents?api-version=2026-06-01" -Headers @{ Authorization = "Bearer $tok" } -SkipHttpErrorCheck -TimeoutSec 60
+    $probeCode = [int]$probe.StatusCode
+} catch { $probeErr = $_.Exception.Message }
+$dataPlaneOk = $probeCode -ge 200 -and $probeCode -lt 300
+$probeDetail = "publicNetworkAccess=$(if ($pna) { $pna } else { 'unknown' }); data-plane probe $(if ($probeCode) { "HTTP $probeCode" } else { "error: $probeErr" })"
+$probeFix = if ($dataPlaneOk) { '' } elseif ($pna -eq 'Disabled') { 'The workspace data plane is private. Run Stage 5 from a runner inside the VNet (or peered/VPN), or set workspace.publicNetworkAccess=Enabled and re-run Stage 4.' } else { 'Confirm the workspace exists and Succeeded, and that the caller has data-plane access to the project.' }
+$results.Add((New-CheckResult -Id 'fr5-data-plane-reachable' -Name 'workspace data plane reachable from this runner' -Status ($dataPlaneOk ? 'Pass' : 'Fail') -Fr 'FR5.3' -Detail $probeDetail -Remediation $probeFix -Data ([pscustomobject]@{ publicNetworkAccess = $pna; statusCode = $probeCode })))
+
+$step = if ($dataPlaneOk) { Invoke-Stage5CreateAgent -ConfigPath $ConfigPath -Workspace $Workspace -Project $Project -ChatModel $ChatModel -Agent $agentName -PassThru } else { @() }
 Add-Many $step
 $state.agentCreated = @($step | Where-Object { $_.id -eq 'fr5-3-agent-created' -and $_.status -eq 'Pass' }).Count -gt 0
 Write-State -Path $statePath -State $state
@@ -450,6 +594,6 @@ $certified = -not (Has-Fail $results.ToArray()) -and [bool]$state.responseReceiv
 $results.Add((New-CheckResult -Id 'fr5-certification-verdict' -Name 'Stage 5 certification verdict' -Status ($certified ? 'Pass' : 'Fail') -Fr 'FR5.3-FR5.7' -Detail ($certified ? 'CERTIFIED' : 'NOT CERTIFIED') -Remediation ($certified ? '' : 'Any failed check blocks certification; a run without an agent answer is not certified.') -Data ([pscustomobject]@{ verdict = ($certified ? 'CERTIFIED' : 'NOT CERTIFIED'); stateFile = $statePath; responsePath = $responsePath })))
 
 $extra = [pscustomobject]@{ verdict = ($certified ? 'CERTIFIED' : 'NOT CERTIFIED'); stateFile = $statePath; responsePath = $responsePath }
+if ($PassThru) { return $results.ToArray() }
 $null = Write-OnboardingReport -Results $results.ToArray() -Title 'Stage 5 · agent Q&A certification (FR5.3-FR5.7)' -JsonPath $JsonPath -Extra $extra
 Complete-Stage -Results $results.ToArray()
-

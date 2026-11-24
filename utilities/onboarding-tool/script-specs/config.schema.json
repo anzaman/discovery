@@ -12,7 +12,8 @@
     "network",
     "sizingTier",
     "names",
-    "deployingIdentity"
+    "deployingIdentity",
+    "rbac"
   ],
   "properties": {
     "schemaVersion": {
@@ -48,10 +49,40 @@
       ]
     },
     "controlPlaneRegion": {
-      "type": "string"
+      "type": "string",
+      "description": "Region for Discovery control-plane resources. Can differ from workloadRegion."
     },
     "workloadRegion": {
-      "type": "string"
+      "type": "string",
+      "description": "Region for the VNet/subnets and all managed-resource-group resources."
+    },
+    "systemSku": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Supercomputer system-pool VM SKU selected in the planning form or JSON config. Defaults to Standard_D4s_v6. Stages 1 and 3 check quota for 3 nodes of this SKU."
+    },
+    "nodePoolVmSize": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional Stage 4 node-pool VM SKU override. Defaults to Standard_D4ds_v6."
+    },
+    "nodePoolMinNodeCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional Stage 4 node-pool minimum node count override. Defaults to 0."
+    },
+    "nodePoolMaxNodeCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional Stage 4 node-pool maximum node count override. Defaults to 3."
+    },
+    "nodePoolScaleSetPriority": {
+      "type": "string",
+      "enum": [
+        "Regular",
+        "Spot"
+      ],
+      "description": "Optional Stage 4 node-pool scale-set priority override. Defaults to Regular."
     },
     "deployingIdentity": {
       "type": "object",
@@ -76,6 +107,67 @@
         }
       }
     },
+    "rbac": {
+      "type": "object",
+      "required": [
+        "humanAccessMode"
+      ],
+      "properties": {
+        "humanAccessMode": {
+          "type": "string",
+          "enum": [
+            "permanent-role-assignments",
+            "customer-jit-managed"
+          ],
+          "description": "Controls only User-principal assignments. Workload identity RBAC assignments remain persistent and tool-created."
+        },
+        "jitEligibilityDurationDays": {
+          "type": "integer",
+          "minimum": 7,
+          "maximum": 3650,
+          "description": "Requested duration in days for newly created PIM eligibility. Required only for customer-jit-managed; existing valid eligibility can be reused, and users must activate eligible roles before use."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "humanAccessMode": {
+                "const": "customer-jit-managed"
+              }
+            },
+            "required": [
+              "humanAccessMode"
+            ]
+          },
+          "then": {
+            "required": [
+              "jitEligibilityDurationDays"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "humanAccessMode": {
+                "const": "permanent-role-assignments"
+              }
+            },
+            "required": [
+              "humanAccessMode"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "jitEligibilityDurationDays"
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
     "network": {
       "type": "object",
       "required": [
@@ -98,6 +190,10 @@
         },
         "networkResourceGroup": {
           "type": "string"
+        },
+        "dnsResourceGroup": {
+          "type": "string",
+          "description": "Resource group containing the private DNS zones linked to the Discovery VNet. Defaults to networkResourceGroup when omitted."
         },
         "vnetName": {
           "type": "string",
@@ -179,16 +275,18 @@
         "model": {
           "type": "string",
           "enum": [
-            "byo",
-            "managed"
-          ]
+            "byo"
+          ],
+          "default": "byo",
+          "description": "Must be byo. Every Discovery project requires a storage container backed by a customer storage account; managed project storage isn't supported."
         },
         "account": {
-          "type": "string"
+          "type": "string",
+          "description": "Storage account name for project storage. Stage 2 creates it in the network resource group if it does not exist."
         },
         "accountId": {
           "type": "string",
-          "description": "Resource id of the storage account used for the bookshelf (consumed by Stage 4 when bookshelf is in scope)."
+          "description": "Resource id of the storage account used by the project storage container."
         },
         "access": {
           "type": "string",
@@ -196,6 +294,25 @@
             "privateEndpoint",
             "serviceEndpoint"
           ]
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "publicNetworkAccess": {
+          "type": "string",
+          "enum": [
+            "Enabled",
+            "Disabled"
+          ],
+          "default": "Enabled",
+          "description": "Workspace data-plane public network access. Disabled limits agent, investigation and conversation calls (Stage 5) to runners inside the VNet."
+        },
+        "networkIsolation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Controls Workbench network isolation independently of publicNetworkAccess. When true, Workbench access requires VPN or ExpressRoute connectivity to the workspace VNet."
         }
       }
     },

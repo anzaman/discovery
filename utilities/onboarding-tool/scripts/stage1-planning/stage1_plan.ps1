@@ -1,3 +1,4 @@
+#!/usr/bin/env pwsh
 #Requires -Version 7.0
 <#
 .SYNOPSIS
@@ -45,7 +46,9 @@ function Read-XlsxSheet {
         [Parameter(Mandatory)][string]$SheetName
     )
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $Path))
+    # Share read/write so a form that is still open in Excel can be read.
+    $stream = [System.IO.File]::Open((Resolve-Path -LiteralPath $Path).ProviderPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $zip = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Read)
     try {
         function Get-Entry([string]$name) { $zip.Entries | Where-Object { $_.FullName -eq $name } | Select-Object -First 1 }
         function Read-Xml($entry) {
@@ -105,7 +108,7 @@ function Read-XlsxSheet {
         }
         return $cells
     }
-    finally { $zip.Dispose() }
+    finally { $zip.Dispose(); $stream.Dispose() }
 }
 
 function Split-CellRef {
@@ -154,7 +157,7 @@ function ConvertFrom-ConfigSheet {
             'POLICY' { if ($b.Trim()) { $policies.Add($b.Trim()) } }
             'WAIVER' { if ($b.Trim()) { $waivers.Add([pscustomobject]@{ check = $b.Trim(); justification = $c.Trim(); approvedBy = $d.Trim() }) } }
             default {
-                if ($a -match '\.' -or $a -match '^[a-z]') { if ($b -ne '') { $scalars[$a] = $b.Trim() } }
+                if ($a -match '\.' -or $a -cmatch '^[a-z]') { if ($b -ne '') { $scalars[$a] = $b.Trim() } }
             }
         }
     }
@@ -178,6 +181,11 @@ function ConvertTo-ConfigModel {
     $subnets = @($Parsed.Subnets | ForEach-Object {
             [ordered]@{ role = $_.role; cidr = $_.cidr; requiredPrefix = $_.requiredPrefix; delegation = $_.delegation }
         })
+    $rbac = [ordered]@{ humanAccessMode = (Val 'rbac.humanAccessMode') }
+    $jitDuration = Val 'rbac.jitEligibilityDurationDays'
+    if ($null -ne $jitDuration -and "$jitDuration".Trim()) {
+        $rbac.jitEligibilityDurationDays = $jitDuration
+    }
 
     $model = [ordered]@{
         schemaVersion     = (Val 'schemaVersion' '1.0')
@@ -192,9 +200,11 @@ function ConvertTo-ConfigModel {
             type                = (Val 'deployingIdentity.type' 'user')
             canRegisterProviders = (Bool 'deployingIdentity.canRegisterProviders' $false)
         }
+        rbac              = $rbac
         network           = [ordered]@{
             model                = (Val 'network.model' 'byo')
             networkResourceGroup = (Val 'network.networkResourceGroup')
+            dnsResourceGroup     = (Val 'network.dnsResourceGroup')
             vnetName             = (Val 'network.vnetName')
             vnetCidr             = (Val 'network.vnetCidr')
             corpDns              = (CsvList 'network.corpDns')
@@ -205,13 +215,18 @@ function ConvertTo-ConfigModel {
             subnets              = $subnets
         }
         storage           = [ordered]@{
-            model  = (Val 'storage.model' 'managed')
+            model  = (Val 'storage.model' 'byo')
             account = (Val 'storage.account')
             accountId = (Val 'storage.accountId')
             access = (Val 'storage.access' 'privateEndpoint')
         }
+        workspace         = [ordered]@{
+            publicNetworkAccess = (Val 'workspace.publicNetworkAccess' 'Enabled')
+            networkIsolation    = (Bool 'workspace.networkIsolation' $true)
+        }
         sizingTier        = (Val 'sizingTier' 'Small')
-        bookshelf         = [ordered]@{
+        systemSku         = (Val 'systemSku' 'Standard_D4s_v6')
+        bookshelf           = [ordered]@{
             inScope   = (Bool 'bookshelf.inScope' $false)
             instances = [int](Val 'bookshelf.instances' '0')
         }
@@ -233,6 +248,68 @@ function ConvertTo-ConfigModel {
     }
     # prune empty-string leaf values so downstream required checks catch true blanks
     return $model
+}
+
+function Merge-ConfigDefaults {
+    <#
+    .SYNOPSIS Fill keys missing from a JSON-loaded config with the planning-form defaults, recursively,
+      so JSON and .xlsx input reach the checks in the same shape (StrictMode throws on absent properties).
+      Values present in the JSON always win.
+    #>
+    param([Parameter(Mandatory)][object]$Config, [Parameter(Mandatory)][object]$Defaults)
+    foreach ($p in $Defaults.PSObject.Properties) {
+        $existing = $Config.PSObject.Properties[$p.Name]
+        if (-not $existing) { $Config | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+        elseif ($p.Value -is [pscustomobject] -and $existing.Value -is [pscustomobject]) { $null = Merge-ConfigDefaults -Config $existing.Value -Defaults $p.Value }
+    }
+    return $Config
+}
+
+function Get-RequiredVmSkuResult {
+    param(
+        [Parameter(Mandatory)][object[]]$Skus,
+        [Parameter(Mandatory)][string]$Region,
+        [object]$Config
+    )
+
+    $systemSku = if ($Config -and $Config.PSObject.Properties.Name -contains 'systemSku' -and $Config.systemSku) { [string]$Config.systemSku } else { 'Standard_D4s_v6' }
+    $nodePoolSku = if ($Config -and $Config.PSObject.Properties.Name -contains 'nodePoolVmSize' -and $Config.nodePoolVmSize) { [string]$Config.nodePoolVmSize } else { 'Standard_D4ds_v6' }
+    $nodePoolMax = if ($Config -and $Config.PSObject.Properties.Name -contains 'nodePoolMaxNodeCount' -and $null -ne $Config.nodePoolMaxNodeCount) { [int]$Config.nodePoolMaxNodeCount } else { 3 }
+    $required = @([pscustomobject]@{ name = $systemSku; purpose = 'system pool' })
+    if ($nodePoolMax -gt 0) {
+        $required += [pscustomobject]@{ name = $nodePoolSku; purpose = 'node-pool autoscale' }
+    }
+    $unavailable = [System.Collections.Generic.List[object]]::new()
+    $data = @($required | ForEach-Object {
+            $requirement = $_
+            $record = @($Skus | Where-Object { $_.name -eq $requirement.name } | Select-Object -First 1)
+            $restrictions = @(if ($record.Count -and $record[0].PSObject.Properties.Name -contains 'restrictions') {
+                    $record[0].restrictions | Where-Object { $null -ne $_ }
+                })
+            $available = $record.Count -gt 0 -and @($restrictions).Count -eq 0
+            if (-not $available) {
+                $reason = if (-not $record.Count) { 'not offered' } else { 'restricted for this subscription' }
+                $unavailable.Add([pscustomobject]@{ name = $requirement.name; purpose = $requirement.purpose; reason = $reason })
+            }
+            [pscustomobject]@{
+                name             = $requirement.name
+                purpose          = $requirement.purpose
+                available        = $available
+                restrictionCount = @($restrictions).Count
+            }
+        })
+
+    if ($unavailable.Count) {
+        $summary = ($unavailable | ForEach-Object { "$($_.name) ($($_.purpose)): $($_.reason)" }) -join '; '
+        return New-CheckResult -Id 'sku-region' -Name 'Required VM SKU availability' -Status 'Fail' -Fr 'FR1.5' `
+            -Detail "$Region cannot currently supply every required supercomputer VM SKU. $summary." `
+            -Remediation "Choose a region where the configured SKUs are available to this subscription, change the effective Stage 4 SKU configuration, or resolve the subscription restriction, then re-run Stage 1." `
+            -Data $data
+    }
+
+    return New-CheckResult -Id 'sku-region' -Name 'Required VM SKU availability' -Status 'Pass' -Fr 'FR1.5' `
+        -Detail "Every VM SKU required by the effective Stage 4 configuration is available to this subscription in ${Region}: $(($required | ForEach-Object { "$($_.name) ($($_.purpose))" }) -join ', ')." `
+        -Data $data
 }
 
 # ===========================================================================
@@ -274,8 +351,9 @@ $script:NameRules = @{
 $script:KnownDenyPolicies = @(
     @{ Match = 'Cognitive Services'; Handling = 'exemption'; Note = 'Cognitive Services public network access deny blocks Foundry provisioning.' }
     @{ Match = 'Log Analytics';      Handling = 'exemption'; Note = 'Log Analytics public access deny blocks workspace diagnostics.' }
-    @{ Match = 'Storage account';    Handling = 'configuration'; Note = 'Storage public access deny requires private-endpoint config.' }
+    @{ Match = 'Storage account.*(public|network access)'; Handling = 'exemption'; Note = 'Discovery creates managed-RG storage accounts with public network access Enabled (NSP enforced); a deny blocks workspace and Bookshelf provisioning.' }
     @{ Match = 'network security perimeter'; Handling = 'exemption'; Note = 'NSP association policy must allow the Discovery perimeter.' }
+    @{ Match = 'Always use JIT for permissions'; Handling = 'customer-jit-managed'; Note = 'Permanent human role assignments are denied; select customer-jit-managed for human access.'; HumanRbacOnly = $true }
 )
 $script:CapacityLimitedRegions = @('eastus2')  # AKSCapacityHeavyUsage observed
 
@@ -283,6 +361,19 @@ $script:CapacityLimitedRegions = @('eastus2')  # AKSCapacityHeavyUsage observed
 # Validation checks (FR1.0 - FR1.7)
 # ===========================================================================
 function Test-Field { param($v) ($null -ne $v) -and ("$v".Trim() -ne '') }
+
+function Get-Stage1PropertyValue {
+    param([object]$Object, [string]$Name)
+
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
 
 function Get-LivePolicyAssignments {
     <#
@@ -297,18 +388,13 @@ function Get-LivePolicyAssignments {
     $defCache = @{}
     $out = [System.Collections.Generic.List[object]]::new()
     foreach ($a in @($assignments)) {
-        $defId = [string]$a.policyDefinitionId
+        if ($null -eq $a) { continue }
+        $defId = [string](Get-Stage1PropertyValue -Object $a -Name 'policyDefinitionId')
         $effect = $null
-        try {
-            $params = $a.parameters
-            if ($params -is [psobject] -and ($params.PSObject.Properties.Name -contains 'effect')) {
-                $eff = $params.effect
-                if ($eff -is [psobject] -and ($eff.PSObject.Properties.Name -contains 'value') -and $eff.value) {
-                    $effect = [string]$eff.value
-                }
-            }
-        }
-        catch { $effect = $null }
+        $assignmentParameters = Get-Stage1PropertyValue -Object $a -Name 'parameters'
+        $effectParameter = Get-Stage1PropertyValue -Object $assignmentParameters -Name 'effect'
+        $effectValue = Get-Stage1PropertyValue -Object $effectParameter -Name 'value'
+        if ($effectValue) { $effect = [string]$effectValue }
         $policyType = 'Unknown'
         if ($defId) {
             if (-not $defCache.ContainsKey($defId)) {
@@ -321,23 +407,39 @@ function Get-LivePolicyAssignments {
             }
             $def = $defCache[$defId]
             if ($def) {
-                $policyType = [string]$def.policyType
+                $definitionPolicyType = Get-Stage1PropertyValue -Object $def -Name 'policyType'
+                if ($definitionPolicyType) { $policyType = [string]$definitionPolicyType }
                 if (-not $effect) {
-                    if (($def.PSObject.Properties.Name -contains 'policyRule') -and $def.policyRule.then) {
-                        $rawEffect = [string]$def.policyRule.then.effect
-                        if ($rawEffect -and $rawEffect -notmatch '^\[') { $effect = $rawEffect }
+                    $policyRule = Get-Stage1PropertyValue -Object $def -Name 'policyRule'
+                    $then = Get-Stage1PropertyValue -Object $policyRule -Name 'then'
+                    $rawEffect = [string](Get-Stage1PropertyValue -Object $then -Name 'effect')
+                    if ($rawEffect) {
+                        if ($rawEffect -match "^\[parameters\('([^']+)'\)\]$") {
+                            # Parameterized effect: the assignment value wins, else the definition default.
+                            $pName = $Matches[1]
+                            $assignmentParameter = Get-Stage1PropertyValue -Object $assignmentParameters -Name $pName
+                            $aVal = Get-Stage1PropertyValue -Object $assignmentParameter -Name 'value'
+                            $definitionParameters = Get-Stage1PropertyValue -Object $def -Name 'parameters'
+                            $definitionParameter = Get-Stage1PropertyValue -Object $definitionParameters -Name $pName
+                            $dDef = Get-Stage1PropertyValue -Object $definitionParameter -Name 'defaultValue'
+                            if ($aVal) { $effect = [string]$aVal } elseif ($dDef) { $effect = [string]$dDef }
+                        }
+                        elseif ($rawEffect -and $rawEffect -notmatch '^\[') { $effect = $rawEffect }
                     }
                     elseif ($defId -match '/policySetDefinitions/') { $effect = 'initiative' }
                 }
             }
         }
         if (-not $effect) { $effect = 'unknown' }
+        $name = [string](Get-Stage1PropertyValue -Object $a -Name 'name')
+        $displayName = [string](Get-Stage1PropertyValue -Object $a -Name 'displayName')
+        if (-not $displayName) { $displayName = $name }
         $out.Add([pscustomobject]@{
-                name         = [string]$a.name
-                displayName  = [string]$a.displayName
+                name         = $name
+                displayName  = $displayName
                 policyType   = $policyType
                 effect       = $effect
-                scope        = [string]$a.scope
+                scope        = [string](Get-Stage1PropertyValue -Object $a -Name 'scope')
                 definitionId = $defId
             })
     }
@@ -410,6 +512,7 @@ function Invoke-Stage1Checks {
     if (-not (Test-Field $Cfg.network.vnetCidr)) { $missing += 'network.vnetCidr' }
     if (-not (Test-Field $Cfg.deployingIdentity.objectId)) { $missing += 'deployingIdentity.objectId' }
     if (-not (Test-Field $Cfg.managedIdentity.id)) { $missing += 'managedIdentity.id' }
+    if (-not (Test-Field (Get-Stage1PropertyValue -Object $Cfg.rbac -Name 'humanAccessMode'))) { $missing += 'rbac.humanAccessMode' }
     if (@($Cfg.network.subnets).Count -eq 0) { $missing += 'network.subnets' }
     if ($missing.Count) {
         $R.Add((New-CheckResult -Id 'capture' -Name 'Required fields captured' -Status 'Fail' -Fr 'FR1.1' `
@@ -417,6 +520,41 @@ function Invoke-Stage1Checks {
     }
     else {
         $R.Add((New-CheckResult -Id 'capture' -Name 'Required fields captured' -Status 'Pass' -Fr 'FR1.1' -Detail 'All core planning fields present.'))
+    }
+
+    # ---- FR1.1 human RBAC ownership --------------------------------------
+    $humanAccessMode = [string](Get-Stage1PropertyValue -Object $Cfg.rbac -Name 'humanAccessMode')
+    $jitDurationRaw = Get-Stage1PropertyValue -Object $Cfg.rbac -Name 'jitEligibilityDurationDays'
+    if (@('permanent-role-assignments', 'customer-jit-managed') -notcontains $humanAccessMode) {
+        $R.Add((New-CheckResult -Id 'human-rbac-mode' -Name 'Human RBAC management mode' -Status 'Fail' -Fr 'FR1.1' `
+                    -Detail "rbac.humanAccessMode='$humanAccessMode' is invalid." `
+                    -Remediation "Select permanent-role-assignments or customer-jit-managed in the planning form."))
+    }
+    elseif ($humanAccessMode -eq 'permanent-role-assignments') {
+        if (Test-Field $jitDurationRaw) {
+            $R.Add((New-CheckResult -Id 'human-rbac-mode' -Name 'Human RBAC management mode' -Status 'Fail' -Fr 'FR1.1' `
+                        -Detail 'rbac.jitEligibilityDurationDays must be blank when human access uses permanent-role-assignments.' `
+                        -Remediation 'Clear the JIT eligibility duration or select customer-jit-managed.'))
+        }
+        else {
+            $R.Add((New-CheckResult -Id 'human-rbac-mode' -Name 'Human RBAC management mode' -Status 'Pass' -Fr 'FR1.1' `
+                        -Detail 'permanent-role-assignments: Stage 2 and Stage 4 create ordinary role assignments for users.'))
+        }
+    }
+    else {
+        [int]$jitDurationDays = 0
+        $validDuration = [int]::TryParse([string]$jitDurationRaw, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$jitDurationDays) -and $jitDurationDays -ge 7 -and $jitDurationDays -le 3650
+        if (-not $validDuration) {
+            $R.Add((New-CheckResult -Id 'human-rbac-mode' -Name 'Human RBAC management mode' -Status 'Fail' -Fr 'FR1.1' `
+                        -Detail 'customer-jit-managed requires rbac.jitEligibilityDurationDays to be a whole number from 7 through 3650.' `
+                        -Remediation 'Enter the customer-approved eligibility period in days, from 7 through 3650.'))
+        }
+        else {
+            $Cfg.rbac.jitEligibilityDurationDays = $jitDurationDays
+            $R.Add((New-CheckResult -Id 'human-rbac-mode' -Name 'Human RBAC management mode' -Status 'Pass' -Fr 'FR1.1' `
+                        -Detail "customer-jit-managed: the tool requests $jitDurationDays days for new PIM-eligible User assignments; customers must activate eligible roles before use." `
+                        -Data @{ mode = $humanAccessMode; jitEligibilityDurationDays = $jitDurationDays }))
+        }
     }
 
     # ---- FR1.0 subscription prerequisites --------------------------------
@@ -433,9 +571,26 @@ function Invoke-Stage1Checks {
                         -Detail "Microsoft.Discovery registrationState=$regState (Stage 2 performs registration)." -Data @{ registrationState = $regState }))
         }
         else {
-            $R.Add((New-CheckResult -Id 'sub-prereq' -Name 'Subscription enabled for Discovery' -Status 'Warn' -Fr 'FR1.0' `
-                        -Detail 'Could not read Microsoft.Discovery provider (may be allowlist-gated or access-limited).' `
-                        -Remediation 'Confirm the subscription is allowlisted for Discovery by the Microsoft Discovery team.'))
+            $R.Add((New-CheckResult -Id 'sub-prereq' -Name 'Subscription enabled for Discovery' -Status 'Fail' -Fr 'FR1.0' `
+                        -Detail 'Microsoft.Discovery is not visible in the target subscription. The subscription may not be allowlisted, or the caller may lack permission to read providers.' `
+                        -Remediation 'Confirm the subscription is allowlisted for Microsoft Discovery with your Microsoft account representative and grant the deploying identity permission to read/register resource providers.'))
+        }
+    }
+
+    # ---- FR1.0 managed identity exists (prerequisite the tool does not create) ----
+    $uamiId = [string]$Cfg.managedIdentity.id
+    if ($uamiId -and $uamiId -match '/userAssignedIdentities/') {
+        if (-not $loggedIn) {
+            $R.Add((New-CheckResult -Id 'uami-exists' -Name 'Managed identity exists' -Status 'Skip' -Fr 'FR1.0' `
+                        -Detail 'az not logged in; managedIdentity.id was not resolved.' -Remediation "Run 'az login' and re-run to confirm the identity exists."))
+        }
+        elseif (Get-AzJson -Args @('identity', 'show', '--ids', $uamiId) -AllowFail) {
+            $R.Add((New-CheckResult -Id 'uami-exists' -Name 'Managed identity exists' -Status 'Pass' -Fr 'FR1.0' -Detail $uamiId))
+        }
+        else {
+            $R.Add((New-CheckResult -Id 'uami-exists' -Name 'Managed identity exists' -Status 'Warn' -Fr 'FR1.0' `
+                        -Detail "managedIdentity.id does not resolve to an existing identity: $uamiId. The tool does not create it; Stage 2 skips its role assignments and Stage 4 fails without it." `
+                        -Remediation 'Create it before Stage 2: az group create -n <rg> -l <region>; az identity create -g <rg> -n <name> -l <region>. Or correct managedIdentity.id.'))
         }
     }
     if (-not $Cfg.deployingIdentity.canRegisterProviders) {
@@ -501,6 +656,29 @@ function Invoke-Stage1Checks {
         $R.Add((New-CheckResult -Id 'egress-model' -Name 'Egress model (network.outboundType)' -Status 'Pass' -Fr 'FR1.2' -Detail "outboundType=$outbound"))
     }
 
+    # ---- FR1.2 workspace public network access ----------------------------
+    $pna = [string]$Cfg.workspace.publicNetworkAccess
+    if ([string]::IsNullOrWhiteSpace($pna)) { $pna = 'Enabled' }
+    if ($pna -notin @('Enabled', 'Disabled')) {
+        $R.Add((New-CheckResult -Id 'workspace-public-access' -Name 'Workspace public network access' -Status 'Fail' -Fr 'FR1.2' `
+                    -Detail "workspace.publicNetworkAccess='$pna' is not valid." `
+                    -Remediation "Set workspace.publicNetworkAccess to 'Enabled' or 'Disabled'."))
+    }
+    else {
+        $note = if ($pna -eq 'Disabled') { 'data plane reachable only from inside the VNet; run Stage 5 from a runner with private network access' } else { 'data plane reachable from any authenticated runner' }
+        $R.Add((New-CheckResult -Id 'workspace-public-access' -Name 'Workspace public network access' -Status 'Pass' -Fr 'FR1.2' -Detail "publicNetworkAccess=$pna; $note"))
+    }
+
+    $networkIsolation = if ($null -ne $Cfg.workspace.networkIsolation) { [bool]$Cfg.workspace.networkIsolation } else { $true }
+    $isolationNote = if ($networkIsolation) {
+        'Workbench access requires VPN or ExpressRoute connectivity to the workspace VNet; publicNetworkAccess controls the workspace data plane separately.'
+    }
+    else {
+        'Workbench is publicly reachable for authenticated users; workspace data-plane reachability still follows publicNetworkAccess.'
+    }
+    $R.Add((New-CheckResult -Id 'workspace-network-isolation' -Name 'Workspace network isolation' -Status 'Pass' -Fr 'FR1.2' `
+                -Detail "networkIsolation=$($networkIsolation.ToString().ToLowerInvariant()); $isolationNote"))
+
     # ---- FR1.2 network model intent --------------------------------------
     $netModel = [string]$Cfg.network.model
     if ([string]::IsNullOrWhiteSpace($netModel)) { $netModel = 'byo-spoke' }
@@ -537,11 +715,34 @@ function Invoke-Stage1Checks {
             $existing = Get-AzJson -Args @('network', 'vnet', 'show', '-g', $byoRg, '-n', $byoVnet, '--subscription', $Cfg.subscriptionId) -AllowFail
             if ($existing) {
                 $loc = [string]$existing.location
-                $status = if ($loc -and $Cfg.controlPlaneRegion -and $loc -ne $Cfg.controlPlaneRegion) { 'Fail' } else { 'Pass' }
+                $status = if ($loc -and $Cfg.workloadRegion -and $loc -ne $Cfg.workloadRegion) { 'Fail' } else { 'Pass' }
                 $R.Add((New-CheckResult -Id 'byo-vnet' -Name 'Existing VNet (byo-existing)' -Status $status -Fr 'FR1.2' `
                             -Detail "VNet '$byoVnet' found in '$byoRg' (location=$loc, address space=$(@($existing.addressSpace.addressPrefixes) -join ','))." `
-                            -Remediation ($status -eq 'Fail' ? "Set controlPlaneRegion/workloadRegion to '$loc' (the VNet's region) or use a VNet in '$($Cfg.controlPlaneRegion)'." : '') `
+                            -Remediation ($status -eq 'Fail' ? "Set workloadRegion to '$loc' (the VNet's region) or use a VNet in '$($Cfg.workloadRegion)'. controlPlaneRegion can differ." : '') `
                             -Data @{ vnetId = $existing.id; location = $loc }))
+                # Customer subnets keep their own names; later stages default to snet-<role>, so
+                # record each existing subnet's real name, matched by the planned CIDR.
+                $mapped = @(); $missing = @()
+                foreach ($sn in @($Cfg.network.subnets)) {
+                    $match = @($existing.subnets) | Where-Object {
+                        $p = $_.PSObject.Properties
+                        (@($p['addressPrefix'] ? $p['addressPrefix'].Value : $null) + @($p['addressPrefixes'] ? $p['addressPrefixes'].Value : $null)) -contains [string]$sn.cidr
+                    } | Select-Object -First 1
+                    if ($match) {
+                        $sn | Add-Member -NotePropertyName name -NotePropertyValue ([string]$match.name) -Force
+                        $mapped += "$($sn.role)=$($match.name)"
+                    }
+                    else { $missing += "$($sn.role) ($($sn.cidr))" }
+                }
+                if ($missing.Count) {
+                    $R.Add((New-CheckResult -Id 'byo-subnets' -Name 'Existing subnets (byo-existing)' -Status 'Fail' -Fr 'FR1.2' `
+                                -Detail "No subnet in '$byoVnet' has the planned CIDR for: $($missing -join ', ')." `
+                                -Remediation "Set each SUBNET row's CIDR to the address prefix of the matching subnet in your VNet, or create the missing subnets (az network vnet subnet list -g $byoRg --vnet-name $byoVnet -o table)."))
+                }
+                else {
+                    $R.Add((New-CheckResult -Id 'byo-subnets' -Name 'Existing subnets (byo-existing)' -Status 'Pass' -Fr 'FR1.2' `
+                                -Detail "Matched by CIDR: $($mapped -join ', ')."))
+                }
             }
             else {
                 $hint = if (Test-Field $Cfg.network.vnetName) { '' } else { " network.vnetName is blank, so the tool assumed 'vnet-<names.workspace>'." }
@@ -594,71 +795,68 @@ function Invoke-Stage1Checks {
         $R.Add((New-CheckResult -Id 'region-capacity' -Name 'Region capacity' -Status 'Pass' -Fr 'FR1.4' -Detail "No known capacity flag for '$($Cfg.workloadRegion)'."))
     }
 
+    # ---- Project storage: every Discovery project needs a storage container ----
+    $stModel = if (Test-Field $Cfg.storage.model) { [string]$Cfg.storage.model } else { 'byo' }
+    $stAccount = @($Cfg.storage.account, $Cfg.storage.accountId) | Where-Object { Test-Field $_ } | Select-Object -First 1
+    $stCreateCmd = "az storage account create -g <rg> -n <globally-unique-name> -l $($Cfg.workloadRegion) --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false"
+    $stPrecreate = "Set storage.account (the storage.account cell in the planning form) to the name of an existing StorageV2 account in this subscription; the tool does not create it. To create one, run: $stCreateCmd. Then re-run Stage 1."
+    if ($stModel -ne 'byo') {
+        $R.Add((New-CheckResult -Id 'project-storage' -Name 'Project storage account' -Status 'Fail' -Fr 'FR1.1' `
+                    -Detail "storage.model=$stModel. Every Discovery project needs a storage container backed by a storage account you own, so only storage.model=byo is supported." `
+                    -Remediation "Set storage.model to byo. $stPrecreate"))
+    }
+    elseif (-not $stAccount) {
+        $R.Add((New-CheckResult -Id 'project-storage' -Name 'Project storage account' -Status 'Fail' -Fr 'FR1.1' `
+                    -Detail 'storage.account is empty. Every Discovery project needs a storage container backed by a storage account you own.' `
+                    -Remediation $stPrecreate))
+    }
+    elseif (-not $loggedIn) {
+        $R.Add((New-CheckResult -Id 'project-storage' -Name 'Project storage account' -Status 'Warn' -Fr 'FR1.1' `
+                    -Detail "az not logged in; storage account '$stAccount' was not checked." `
+                    -Remediation "Run 'az login' and re-run to confirm the account exists."))
+    }
+    else {
+        $stArgs = if ($stAccount -match '/storageAccounts/') { @('storage', 'account', 'show', '--ids', $stAccount) }
+        else { @('storage', 'account', 'show', '-n', $stAccount, '--subscription', $Cfg.subscriptionId) }
+        $st = Get-AzJson -Args $stArgs -AllowFail
+        if ($st -and $st.id) {
+            # Persist the resolved id so Stages 2 and 4 target this account and its resource group.
+            $Cfg.storage | Add-Member -NotePropertyName accountId -NotePropertyValue ([string]$st.id) -Force
+            $R.Add((New-CheckResult -Id 'project-storage' -Name 'Project storage account' -Status 'Pass' -Fr 'FR1.1' `
+                        -Detail "Found $($st.id) ($($st.kind), $($st.location))." -Data @{ id = $st.id; location = $st.location; kind = $st.kind }))
+        }
+        else {
+            $R.Add((New-CheckResult -Id 'project-storage' -Name 'Project storage account' -Status 'Fail' -Fr 'FR1.1' `
+                        -Detail "Storage account '$stAccount' was not found in subscription $($Cfg.subscriptionId)." `
+                        -Remediation "Check the storage.account name for typos and that the account is in subscription $($Cfg.subscriptionId). $stPrecreate"))
+        }
+    }
+
     # ---- FR1.5 quota / SKU / TPM / Cosmos --------------------------------
     $cosmosRu = 2400 + 400 * [int]$Cfg.projects
     $R.Add((New-CheckResult -Id 'cosmos-ru' -Name 'Cosmos RU/s sizing' -Status 'Pass' -Fr 'FR1.5' `
                 -Detail "Projects=$($Cfg.projects) -> required autoscale $cosmosRu RU/s (2400 + 400 x projects)." -Data @{ requiredRuPerSec = $cosmosRu }))
     if ($loggedIn) {
-        $skus = Get-AzJson -Args @('vm', 'list-skus', '--location', $Cfg.workloadRegion, '--resource-type', 'virtualMachines') -AllowFail
+        $skus = Get-AzJson -Args @('vm', 'list-skus', '--location', $Cfg.workloadRegion, '--resource-type', 'virtualMachines', '--subscription', $Cfg.subscriptionId) -AllowFail
         if ($skus) {
-            $offered = @($skus | ForEach-Object { $_.name })
-            if ($offered -contains 'Standard_D4s_v6' -and $offered -notcontains 'Standard_D4ds_v6') {
-                # informational only
-            }
-            $R.Add((New-CheckResult -Id 'sku-region' -Name 'VM SKU availability' -Status 'Pass' -Fr 'FR1.5' -Detail "$($offered.Count) VM SKUs offered in $($Cfg.workloadRegion)."))
+            $R.Add((Get-RequiredVmSkuResult -Skus @($skus) -Region $Cfg.workloadRegion -Config $Cfg))
         }
         else {
-            $R.Add((New-CheckResult -Id 'sku-region' -Name 'VM SKU availability' -Status 'Warn' -Fr 'FR1.5' -Detail 'Could not enumerate VM SKUs.' -Remediation 'Verify vm list-skus access for the workload region.'))
+            $R.Add((New-CheckResult -Id 'sku-region' -Name 'Required VM SKU availability' -Status 'Warn' -Fr 'FR1.5' -Detail 'Could not enumerate VM SKUs.' -Remediation 'Verify vm list-skus access for the workload region.'))
         }
 
-        # Compute quota for the supercomputer pools Stage 4 deploys: the service-default system pool
-        # (3 x Standard_D4s_v6) is validated at submit time, so a shortfall rejects the deployment
-        # ("Insufficient quota ... Total Regional vCPUs"). The node pool (min 0, max 3 x Standard_D4ds_v6)
-        # only needs headroom when it autoscales.
-        $sysNeed = 12; $npNeed = 12
-        $usage = Get-AzJson -Args @('vm', 'list-usage', '--location', $Cfg.workloadRegion) -AllowFail
-        if (-not $usage) {
-            $R.Add((New-CheckResult -Id 'vcpu-quota' -Name 'Compute vCPU quota' -Status 'Warn' -Fr 'FR1.5' `
-                        -Detail "Could not read compute usage/quota for $($Cfg.workloadRegion) (az vm list-usage failed), so the supercomputer's $sysNeed-vCPU system pool requirement was not verified." `
-                        -Remediation "Confirm in the portal (Subscriptions > Usage + quotas) that '$($Cfg.workloadRegion)' has at least $sysNeed free Total Regional vCPUs and $sysNeed free Standard DSv6 Family vCPUs (plus $npNeed DDSv6 for node-pool autoscale)."))
-        }
-        else {
-            $avail = @{}
-            foreach ($u in @($usage)) { $avail[[string]$u.name.value] = [int]$u.limit - [int]$u.currentValue }
-            $needs = @(
-                [pscustomobject]@{ quota = 'cores'; label = 'Total Regional vCPUs'; hard = $sysNeed; soft = $sysNeed + $npNeed }
-                [pscustomobject]@{ quota = 'StandardDsv6Family'; label = 'Standard DSv6 Family vCPUs (system pool)'; hard = $sysNeed; soft = $sysNeed }
-                [pscustomobject]@{ quota = 'StandardDdsv6Family'; label = 'Standard DDSv6 Family vCPUs (node pool autoscale)'; hard = 0; soft = $npNeed }
-            )
-            $short = @(foreach ($n in $needs) {
-                    $a = if ($avail.ContainsKey($n.quota)) { $avail[$n.quota] } else { 0 }
-                    if ($a -lt $n.soft) {
-                        [pscustomobject]@{ service = "Microsoft.Compute/$($n.quota)"; label = $n.label; region = $Cfg.workloadRegion; available = $a; required = $n.soft; blocking = ($a -lt $n.hard) }
-                    }
-                })
-            $summary = ($short | ForEach-Object { "$($_.label): available $($_.available), need $($_.required)" }) -join '; '
-            $fix = "Request a quota increase for $($Cfg.workloadRegion) (Subscriptions > Usage + quotas, or: az quota update --resource-name <quota> --scope /subscriptions/$($Cfg.subscriptionId)/providers/Microsoft.Compute/locations/$($Cfg.workloadRegion) --limit-object value=<new-limit> --resource-type dedicated), then re-run Stage 1."
-            if (@($short | Where-Object blocking).Count) {
-                $R.Add((New-CheckResult -Id 'vcpu-quota' -Name 'Compute vCPU quota' -Status 'Fail' -Fr 'FR1.5' `
-                            -Detail "Not enough compute quota for the supercomputer system pool (3 x Standard_D4s_v6 = $sysNeed vCPUs). Stage 4 would be rejected with 'Insufficient quota'. $summary." `
-                            -Remediation "$fix Or record a WAIVER row (check=vcpu-quota + justification) if the increase is already in flight." -Data $short))
-            }
-            elseif ($short.Count) {
-                $R.Add((New-CheckResult -Id 'vcpu-quota' -Name 'Compute vCPU quota' -Status 'Warn' -Fr 'FR1.5' `
-                            -Detail "Enough quota to deploy the supercomputer system pool ($sysNeed vCPUs), but not for the node pool to autoscale to 3 x Standard_D4ds_v6 ($npNeed vCPUs); jobs that need the node pool to scale out will stay pending. $summary." `
-                            -Remediation $fix -Data $short))
-            }
-            else {
-                $R.Add((New-CheckResult -Id 'vcpu-quota' -Name 'Compute vCPU quota' -Status 'Pass' -Fr 'FR1.5' `
-                            -Detail "$($Cfg.workloadRegion) has room for the system pool ($sysNeed vCPUs DSv6) and node-pool autoscale ($npNeed vCPUs DDSv6); Total Regional vCPUs available: $($avail['cores'])."))
-            }
-        }
+        $R.Add((Get-VcpuQuotaResult -Config $Cfg -Fr 'FR1.5' -RerunStage 'Stage 1' -SkuCatalog @($skus)))
     }
     else {
-        $R.Add((New-CheckResult -Id 'sku-region' -Name 'VM SKU availability' -Status 'Skip' -Fr 'FR1.5' -Detail 'az not logged in; SKU-in-region not checked. Note: Standard_D4s_v6 is not offered in eastus/eastus2 (use Standard_D4ds_v6).'))
+        $R.Add((New-CheckResult -Id 'sku-region' -Name 'Required VM SKU availability' -Status 'Skip' -Fr 'FR1.5' -Detail 'az not logged in; effective Stage 4 VM SKU availability was not checked.'))
     }
     if ($Cfg.deployMode -eq 'DataZoneStandard') {
         $R.Add((New-CheckResult -Id 'deploy-mode' -Name 'Deploy mode' -Status 'Warn' -Fr 'FR1.5' -Detail 'DataZoneStandard selected for data residency; confirm model availability in the data zone.'))
+    }
+
+    # Model TPM quota (shared with the Stage 3 re-check).
+    if ($loggedIn -and (Test-Field $Cfg.workloadRegion)) {
+        $R.Add((Get-ModelQuotaResult -Config $Cfg -Fr 'FR1.5' -RerunStage 'Stage 1'))
     }
 
     # ---- FR1.6 naming rules ----------------------------------------------
@@ -712,8 +910,11 @@ function Invoke-Stage1Checks {
     $conflicts = @()
     foreach ($p in $candidateNames) {
         foreach ($known in $script:KnownDenyPolicies) {
-            if ($p -match [regex]::Escape($known.Match)) {
+            if ($p -match $known.Match) {
+                if ($known.ContainsKey('HumanRbacOnly') -and $known.HumanRbacOnly -and $humanAccessMode -eq 'customer-jit-managed') { continue }
                 $liveMatch = if ($live) { @($live | Where-Object { $_.displayName -eq $p -or $_.name -eq $p }) | Select-Object -First 1 } else { $null }
+                # Audit/Disabled assignments can't block a deployment; only deny-type or unresolved effects count.
+                if ($liveMatch -and @('audit', 'auditIfNotExists', 'disabled') -contains $liveMatch.effect) { continue }
                 $conflicts += [pscustomobject]@{
                     policy         = $p
                     handling       = $known.Handling
@@ -811,12 +1012,25 @@ $ext = [System.IO.Path]::GetExtension($FormPath).ToLowerInvariant()
 
 if ($ext -eq '.json') {
     $cfgModel = Get-Content -LiteralPath $FormPath -Raw | ConvertFrom-Json
+    $formDefaults = ConvertTo-ConfigModel -Parsed ([pscustomobject]@{ Scalars = @{}; Subnets = @(); Policies = @(); Waivers = @() }) | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $cfgModel = Merge-ConfigDefaults -Config $cfgModel -Defaults $formDefaults
+    # Same fallback the planning form applies: resourceGroup defaults to the network resource group.
+    if (-not (Test-Field $cfgModel.resourceGroup) -and (Test-Field $cfgModel.network.networkResourceGroup)) { $cfgModel.resourceGroup = $cfgModel.network.networkResourceGroup }
     Write-Host "Loaded config model from JSON: $FormPath"
 }
 elseif ($ext -eq '.xlsx') {
-    $cells = Read-XlsxSheet -Path $FormPath -SheetName 'Config'
-    $parsed = ConvertFrom-ConfigSheet -Cells $cells
-    $cfgModel = ConvertTo-ConfigModel -Parsed $parsed
+    # Stop on a read failure: continuing with an empty model runs no checks and reports a false GO.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+    try {
+        $cells = Read-XlsxSheet -Path $FormPath -SheetName 'Config'
+        $parsed = ConvertFrom-ConfigSheet -Cells $cells
+        $cfgModel = ConvertTo-ConfigModel -Parsed $parsed
+    }
+    catch {
+        throw "Could not read the planning form $FormPath : $($_.Exception.Message) Close it in Excel or save a copy, then re-run."
+    }
+    finally { $ErrorActionPreference = $prevEap }
     # Normalize the OrderedDictionary model to the same pscustomobject shape the JSON
     # input path yields, so downstream logic that relies on $cfgModel.PSObject.Properties
     # (waiver application, config export) sees the real keys rather than dictionary members.

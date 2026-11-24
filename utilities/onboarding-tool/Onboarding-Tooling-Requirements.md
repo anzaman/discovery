@@ -19,6 +19,21 @@ are drawn from the Microsoft Discovery product docs:
 Where field evidence and the docs describe the same thing, the docs are the source of
 truth for limits and identifiers; the field evidence supplies the failure signatures.
 
+## Documentation boundaries
+
+This document is the normative product specification: it defines required behavior, priorities
+and acceptance criteria. Related documents have intentionally narrower purposes:
+
+| Document | Owns | Does not own |
+|---|---|---|
+| [Customer user guide](scripts/USER-GUIDE.md) | Prerequisites, exact operator permissions, planning choices, commands, outputs and troubleshooting | Product requirement history or implementation contracts |
+| [Scripts README](scripts/README.md) | Maintainer navigation and implementation map | Customer procedures or duplicated stage requirements |
+| [Per-stage specifications](script-specs/) | Script inputs, outputs, folded checks and FR traceability | Customer runbook instructions |
+
+When operational wording differs, the user guide governs how customers run the current release.
+When expected behavior differs, this requirements specification governs and the implementation
+must be reconciled.
+
 ## Stage map
 
 | Stage | Tool | Owner | Exit gate |
@@ -29,24 +44,44 @@ truth for limits and identifiers; the field evidence supplies the failure signat
 | 4 Platform deployment | Bicep deployer with error-to-remediation engine | Customer | Discovery platform running in tenant |
 | 5 Scenario enablement | End-to-end scenario enablement script | Customer + MSFT | Platform certified ready |
 
-## Stage summary
+## Execution permissions by stage
 
-Detailed view of the five stages. Target timeframes are planning estimates for sequencing, not
-contractual SLAs; the actual driver is each stage's machine-checked exit gate. "MD team" is the
-Microsoft Discovery team.
+This matrix defines access for the **operator identity that runs each stage**. It does not describe
+the target user personas that Stage 2 configures or the workload roles assigned to the platform
+UAMI. Every eligible JIT/PIM role in the matrix must be activated before the stage starts.
 
-| Stage | Name | Steps (FR refs) | Tool format | Optional / Mandatory | Target timeframe | Customer requirements | MD team requirement | Entry criteria | Exit criteria | Risk |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | Planning | Capture params (regions, VNet/subnet CIDRs, identity, policy); embedded validation of subnet sizing/delegation, address-space overlap, region availability/capacity, quota/SKU/TPM/Cosmos, naming, policy pre-flight; emit config only when all pass or waived (FR1.0–1.8). | Spreadsheet (`network-planning-form-template.xlsx`, Config sheet) + PowerShell parser/validator (`stage1_plan.ps1`) → `config.json`. | Mandatory | 1–3 days (customer data gathering) | Planner/architect; `pwsh` 7; `az` login for online checks (optional — local checks run offline); subscription id + network/security/policy docs. | Subscription must be allowlisted/enabled for Discovery by the MD team (FR1.0). Tool self-validates the plan; MD signs off the exported config and reviews only waivers/exceptions. | Target subscription identified; network/security/policy docs and existing subnet inventory available. | Machine-readable `config.json` exported (all P0 checks pass or waived); round-trips into Stages 2–5 with no re-entry. | A wrong CIDR/region/quota/name captured here propagates to every later stage; unjustified waivers hide real blockers until deployment. |
-| 2 | Infra preparation (landing zone) | Register RPs; assign Discovery roles + one-time NSP Perimeter Joiner role; provision BYO VNet/subnets/NSGs/route tables; create + link private DNS zones; BYO storage; emit firewall/NVA request artifact; generate quota + policy-exemption requests; idempotent re-run (FR2.1–2.9). | PowerShell automation (`stage2_prepare.ps1`) + generated firewall-request markdown artifact. | Mandatory | 1–2 days for the script; +2–5 business days for the customer firewall team to apply the NVA artifact. | Subscription-scope admin (Owner / User Access Administrator / RBAC Administrator) to assign roles; Contributor/Owner for RP registration; `pwsh` 7 + `az` CLI; network/firewall team to apply the artifact. | None routine — customer-owned. MD engaged only for policy-exemption approvals or errors. | Signed Stage 1 `config.json`. | Landing zone deployed (identity, network, DNS, storage) and firewall artifact issued; passes Stage 3 with no manual network edits. | Wrong spoke CIDR in the firewall artifact → bootstrap deny loop; missing NSP Joiner role → NSP association failures; in-place route edits fail (`NextHopIpAddressNotAllowed`). |
-| 3 | Infra validation | Read-only control-plane checks (subnet delegation, NSG effective rules, effective routes, private DNS/PE); optional disposable test-VM connectivity harness (DNS, TCP 443, HTTPS, artifact pulls, PE resolution, east-west) then delete VM; emit JSON + human report (FR3.1–3.8). | PowerShell CLI (`stage3_validate.ps1`); VS Code extension planned (P2); ephemeral test VM. | Mandatory gate (the test-VM harness step is optional but recommended) | Minutes per run; ~15–20 min with the test VM. | Reader on the subscription for checks; Contributor on the target RG to create/delete the test VM; `pwsh` 7 + `az` CLI; SSH keygen. | None — fully self-service and re-runnable without a Microsoft round trip. MD only if a failure cannot be remediated. | Landing zone deployed (Stage 2 complete). | Green readiness report; no test VM left behind. | Validator drift if the dependency spec is stale (checks last quarter's deps); skipping the VM harness misses real firewall/TLS-inspection issues. |
-| 4 | Platform deployment | Deploy in dependency order gated on `Succeeded` — supercomputer → workspace → chat model (`gpt-5-4`) → project → bookshelf; true-state detection; error-to-remediation matching; built-in re-PUT recovery; per-step logging (FR4.1–4.6). | PowerShell orchestrator (`stage4_deploy.ps1`) + Bicep templates (`discovery-platform.bicep`), shipped with the product. | Mandatory | ~1–3 hours (AKS + platform provisioning). | Platform Administrator + resource Contributor; `pwsh` 7 + `az` CLI + Bicep; green Stage 3 report. | None routine — the tool maps ARM error signatures to remediations. MD only for uncatalogued failures. | Green Stage 3 readiness report; Stage 1 config + Bicep templates. | Discovery platform running in the tenant (all services `Succeeded`, true-state confirmed). | False `Succeeded` (Foundry still `Creating`) passed downstream; region-capacity AKS failures; soft-deleted Foundry restore conflicts. |
-| 5 | Scenario enablement | Connectivity check from inside the VNet; create tool (ARM PUT); create agent + bind tool; create investigation + conversation; send hero prompt and poll; hard pass/fail on real tool invocation (`function_call` present + Foundry trace); per-service verification summary (FR5.1–5.7). | PowerShell scenario-enablement script (`stage5_enable.ps1`). | Optional (scenario enablement before handoff) | ~30–60 min. | Platform Administrator (data-plane); `pwsh` 7 + `az` CLI; running platform (workspace/project/chat-model names). | Customer + MSFT co-sign the certification verdict (per the stage map). Tool produces the pass/fail; MD reviews the summary at handoff. | Running Discovery platform (Stage 4 complete). | Certification verdict = certified (real tool invocation proven); per-service summary emitted. | A `completed` run with no `function_call` item falsely read as success; agent answering from memory (no `GetNodePoolContext`) never touches the supercomputer. |
+In this specification, **Reader at target-subscription scope** means the Azure built-in Reader
+role (`acdd72a7-3385-48ef-bd42-f606fba81ae7`) assigned at
+`/subscriptions/<target-subscription-id>`, or inherited from a parent management group that
+covers that subscription. A resource-group-only Reader assignment is insufficient because
+Stages 1 and 3 read subscription/location-scoped providers, quotas, model catalogs and policies.
+Microsoft Discovery Platform Reader (`3bb7c424-af4e-436b-bfcc-8779c8934c31`) is a different role
+and does not satisfy this requirement. Owner or Contributor at subscription scope includes the
+required reads, but Azure built-in Reader is the least-privilege built-in role for them.
+
+| Stage | Minimum operator access | Scope | Conditional or optional access |
+|---|---|---|---|
+| 1 — Planning | Azure built-in Reader at target-subscription scope | Target subscription | Complete workspace-name validation also requires `Microsoft.Discovery/checkNameAvailability/action` at subscription scope; Microsoft Discovery Platform Administrator includes it. Without the action, the current implementation omits that check. Microsoft Entra directory read access is required when a principal is supplied by UPN/name rather than object ID. |
+| 2 — Landing zone | Owner, **or** Contributor plus User Access Administrator | Target subscription | Contributor plus Role Based Access Control Administrator is sufficient only when the NSP Perimeter Joiner custom role already exists and `permanent-role-assignments` is selected. Role Based Access Control Administrator cannot create custom role definitions or PIM eligibility schedules. `customer-jit-managed` requires Owner or Contributor plus User Access Administrator and the required tenant license. |
+| 3 — Static validation | Azure built-in Reader at target-subscription scope | Target subscription | When a usable NIC exists, Network Contributor is also required at the scope containing that NIC and the Network Watcher used for effective-NSG, effective-route and next-hop actions. The pre-deployment no-NIC path falls back to read-only subnet, NSG and route-table configuration. |
+| 3 — `-WithVm` validation | Azure built-in Reader at target-subscription scope plus Contributor | Target subscription; probe VM resource group | If the VNet is in another RG, also grant Network Contributor on the VNet/subnet. Access must remain active through VM, NIC and disk cleanup. This mode is not recommended in the current release. |
+| 4 — Platform deployment | Every role listed for the **Platform Administrator persona** under [Roles required by persona](https://learn.microsoft.com/en-us/azure/microsoft-discovery/concept-role-assignments#roles-required-by-persona). A single Discovery role is not the complete permission set. | Every scope specified by Microsoft Learn for that persona, including scopes covering referenced network and UAMI resources | Permanent Foundry assignments in the new workspace managed RG require role-assignment authority there; JIT eligibility requires User Access Administrator or Owner. Assignment failure is a warning, not a platform-deployment failure. |
+| 5 — Scenario enablement | Every role listed for the **Scientist persona** under [Roles required by persona](https://learn.microsoft.com/en-us/azure/microsoft-discovery/concept-role-assignments#roles-required-by-persona). A single Discovery role is not the complete permission set. | Every scope specified by Microsoft Learn for that persona | Network reachability to the workspace data-plane endpoint when public access is disabled. |
+
+The matrix is the normative stage-level permission contract. Customer-facing operation details,
+least-privilege alternatives, PIM activation guidance and workload-identity roles are maintained in the
+[user guide](scripts/USER-GUIDE.md#stage-by-stage-permissions). Functional requirements below
+define the behavior that makes those permissions necessary.
 
 ## Shared design principles
 
 These apply to every tool below.
 
+- Stages 2-5 provide an offline `-DryRun` intent plan from the Stage 1 config, without
+  Azure CLI, HTTP calls, resource mutations or inference. Explicit report paths may
+  write local plan reports. Missing or invalid config fails; a generated plan exits 0
+  with `Skip` results and verdict `PLAN`, never `GO` or certification. It cannot satisfy
+  the Stage 3 readiness gate and does not evaluate live state or replace Azure what-if.
 - Config flows forward. Stage 1 emits one machine-readable config (the single source of
   truth); Stages 2–5 consume it. No stage re-asks for what Stage 1 captured.
 - Every failure returns the exact remediation, not just a red mark.
@@ -58,6 +93,17 @@ These apply to every tool below.
   and macOS.
 - Per-service scoping. Supercomputer, workspace, and bookshelf have different
   dependencies; checks and deploys are scoped by service profile, never one blanket pass.
+
+### Offline dry-run acceptance criteria
+
+- Each Stage 2-5 entry point supports `-DryRun` without Azure CLI, authentication or HTTP calls.
+- Plans preserve profile, VM, recovery and target options without executing those actions.
+- `-JsonPath` writes JSON and sibling Markdown with `PLAN`, zero passes and `Skip` results.
+- `-PassThru` returns plan objects without reports, even when `-JsonPath` is supplied.
+- Dry run doesn't create request, state or response artifacts, provision a VM, or submit inference.
+- Missing, malformed or invalid config exits non-zero; successful plan generation exits 0.
+- Stage 4 rejects a Stage 3 `PLAN` report as readiness evidence.
+- Live `GO`/`NO-GO` reporting and existing stage behavior remain unchanged.
 
 ## Requirement priorities
 
@@ -73,18 +119,13 @@ acceptance criteria are met when its P0 and P1 requirements pass.
 
 ## Script decomposition
 
-Each stage ships as one main script (the orchestrator) plus small single-purpose
-sub-scripts, each with its own mini-spec. This doc stays the authoritative requirements
-source; the per-script specs live in `script-specs/` and map back to the FR ids here. Stage 1
-emits the machine-readable config (`script-specs/config.schema.json`) that Stages 2–5 consume.
-See `script-specs/README.md` for the full script index.
+Each stage has one consolidated PowerShell 7 + Azure CLI script and one matching contract under
+`script-specs/`. Stage 1 emits the config defined by `script-specs/config.schema.json`; Stages 2–5
+consume it. Shared behavior lives in `scripts/lib/OnboardingCommon.psm1`.
 
-The scripts are implemented in PowerShell 7 (`pwsh`) driving Azure CLI (`az`), one `.ps1` per
-spec, under `scripts/` mirroring the `script-specs/` tree. A shared module
-(`scripts/lib/OnboardingCommon.psm1`) provides the common contract every script follows:
-config load, the `az` wrapper, the result model, JSON-plus-report emission, the non-zero exit
-gate, and CIDR math. Each stage's orchestrator (`scripts/stageN-*/stageN_*.ps1`) runs its
-sub-scripts and aggregates their results. See `scripts/README.md` for usage.
+Use the [scripts README](scripts/README.md) for the implementation map, the
+[per-stage spec index](script-specs/README.md) for contracts and FR traceability, and the
+[customer user guide](scripts/USER-GUIDE.md) for execution.
 
 ---
 
@@ -127,7 +168,13 @@ role). Registration needs Contributor or Owner, or a custom role with the RP
 `/register/action`.
 
 FR1.1 [P0] Capture fields: control-plane region, workload region, VNet CIDR, per-service subnet
-CIDRs, BYO storage model, deploying identity, and the policy set.
+CIDRs, BYO storage model, deploying identity, the policy set, and mandatory
+`rbac.humanAccessMode` (`permanent-role-assignments` or `customer-jit-managed`). The JIT mode also
+requires `rbac.jitEligibilityDurationDays` as a whole number from 7 through 3650.
+
+The control-plane region is independent of the workload region. The VNet/subnets and all
+resources in the managed resource groups (MRGs) must share `workloadRegion`. Stage 1 validates
+an existing VNet against that region; Stage 4 checks deployment subnet regions before submission.
 
 FR1.2 [P0] Embedded subnet-sizing validation. Validate each Discovery subnet against the
 required prefix and confirm all fit inside the provided VNet without overlap:
@@ -156,9 +203,12 @@ when quota is healthy. Specifically flag AKS API Server VNet Integration capacit
 workload/control-plane split where a region is capacity-limited.
 
 FR1.5 [P0] Quota and SKU validation. Check vCPU by family, GPU SKUs, private-endpoint count, and
-Foundry/OpenAI TPM. Flag VM SKUs not offered in the target region (for example
-`Standard_D4s_v6` is not offered in eastus/eastus2; use `Standard_D4ds_v6`). Validate the
-documented Discovery quota minimums so shortfalls surface in planning, not deployment:
+Foundry/OpenAI TPM. Resolve the effective Stage 4 system/node SKUs and maximum node count (including
+the SC system SKU dropdown (`systemSku`) in both planning workbooks and advanced JSON overrides),
+preserve the selected system SKU in the exported config for Stage 4, pin SKU and usage reads to the configured subscription, and calculate
+Total Regional plus VM-family vCPU requirements from live SKU metadata. Flag SKUs that are absent
+or restricted in the target region. Validate the documented Discovery quota minimums so shortfalls
+surface in planning, not deployment:
 
 Cosmos DB throughput (autoscale RU/s), sized `2,400 + 400 × projects`:
 
@@ -178,9 +228,15 @@ Model TPM (per workspace, single Bookshelf; multiply Bookshelf models per instan
 | GPT-5 Mini | Bookshelf (per instance) | 2,000,000 | 10,000,000 |
 | Text Embedding 3 Small | Bookshelf (per instance) | 2,000,000 | 2,000,000 |
 
-Ensure at least 500,000 TPM of GPT-5.4 is free (the cognition and `gpt-5-4` validation
-deployments each need 250,000 minimum). Default deploy mode is Global Standard; flag Data
-Zone Standard when the config requires data residency. Bookshelf indexing pulls an
+For the current baseline deployment, ensure at least 450,000 TPM of GPT-5.4 Global Standard is
+free: 250,000 for the workspace's built-in deployment plus 200,000 for the `gpt-5-4` validation
+deployment. On a resumed deployment, count only allocations that do not already exist in
+`Succeeded` state. Validate both `Microsoft.CognitiveServices/locations/usages/read` quota data
+and `Microsoft.CognitiveServices/locations/models/read` regional catalog metadata, including the
+OpenAI provider, GlobalStandard SKU, matching usage name, resolver-selected version, lifecycle,
+quota status and 1K-TPM capacity-unit metadata. Reader at subscription scope grants both read
+operations; Cognitive Services Usages Reader alone does not grant the model-catalog read.
+Bookshelf indexing pulls an
 on-demand supercomputer nodepool sized by tier — Small `Standard_D48s_v6`, Medium
 `Standard_D128s_v6`, Large `Standard_D192s_v6` — plus an always-on Azure AI Search
 Standard S1 and an ACA dedicated profile; account for these when a Bookshelf is in scope.
@@ -233,9 +289,12 @@ waived with a recorded justification.
 
 This stage prepares the customer landing zone from the signed config: RBAC assignment,
 resource-provider registration, quota allocation, and the policy exception requests the
-deployment needs. It writes into the customer subscription, so it needs an admin role at
-subscription scope — Owner, User Access Administrator, or Role Based Access Control
-Administrator to assign the Discovery roles.
+deployment needs. It writes into the customer subscription, so it needs Owner at subscription
+scope, or the combination of Contributor plus User Access Administrator. An
+access-administration role alone cannot provision the landing zone, and Contributor alone cannot
+create its role assignments and custom role. Contributor plus Role Based Access Control
+Administrator is sufficient only after the NSP custom role exists and only for permanent human
+role assignments.
 
 ### Purpose
 
@@ -268,16 +327,28 @@ Access Administrator, or Role Based Access Control Administrator at the scope):
 
 | Role | Definition ID | Use |
 |---|---|---|
-| Platform Administrator (Preview) | `7a2b6e6c-472e-4b39-8878-a26eb63d75c6` | deploying identity — full control-plane + data-plane |
-| Platform Contributor (Preview) | `01288891-85ee-45a7-b367-9db3b752fc65` | scientists — operate resources, no infra create/delete |
-| Platform Reader (Preview) | `3bb7c424-af4e-436b-bfcc-8779c8934c31` | reviewers — read-only |
-| Bookshelf Index Data Reader (Preview) | `8ec773c5-7ce6-4b78-91d1-182f8faa536d` | agents querying knowledge bases |
+| Platform Administrator | `7a2b6e6c-472e-4b39-8878-a26eb63d75c6` | deploying identity — full control-plane + data-plane |
+| Platform Contributor | `01288891-85ee-45a7-b367-9db3b752fc65` | scientists — operate resources, no infra create/delete |
+| Platform Reader | `3bb7c424-af4e-436b-bfcc-8779c8934c31` | reviewers — read-only |
+| Bookshelf Index Data Reader | `8ec773c5-7ce6-4b78-91d1-182f8faa536d` | agents querying knowledge bases |
 
-Platform Administrator does not grant the ability to assign these roles to others. For
+Microsoft Discovery Platform Administrator can create standard role assignments only within the
+scope where that role is assigned. It cannot create subscription custom-role definitions or PIM
+eligibility schedules, and a platform-RG assignment does not cover the workspace managed RG. For
 project-scoped users, pair Project Contributor/Reader with the resource-specific roles
 (Tools Reader, Chat Model Reader, Storage Container Reader/Contributor); the storage
 container roles do not grant blob access, so add Storage Blob Data Reader/Contributor on
 the backing storage scope.
+
+Human user assignment modes:
+
+| Mode | Tool behavior | Customer action |
+|---|---|---|
+| `permanent-role-assignments` | Create standard role assignments. | None for assignment activation. |
+| `customer-jit-managed` | Create or reuse time-bound PIM eligibility with `Microsoft.Authorization/roleEligibilityScheduleRequests` and `requestType=AdminAssign`. | Activate required roles in PIM after Stage 2. |
+
+Eligible-but-inactive is not a Stage 2 failure. Service-principal and managed-identity assignments
+remain persistent.
 
 FR2.1a [P0] NSP Perimeter Joiner custom role. Network hardening is on by default, so before the
 first workspace/supercomputer/bookshelf deploy, create the one-time-per-subscription custom
@@ -285,14 +356,25 @@ role that lets the Discovery control-plane service principal (app ID
 `92c174ac-8e41-4815-a1b7-d81b19ab03ce`) join managed PaaS resources to the workspace NSP.
 It needs exactly `Microsoft.Network/networkSecurityPerimeters/joinPerimeterRule/action` and
 `Microsoft.Network/locations/networkSecurityPerimeterOperationStatuses/read`, assigned at
-subscription scope. Without it, resource creation fails with NSP association errors.
+subscription scope. Creating the definition requires
+`Microsoft.Authorization/roleDefinitions/write`, which Owner and User Access Administrator
+provide but Role Based Access Control Administrator does not. Without the role, resource creation
+fails with NSP association errors.
 
 FR2.2 [P0] BYO network provisioning from config, deployed declaratively via `network.bicep`
 (one RG-scoped deployment covering FR2.2-FR2.5): VNet, subnets with the delegations from FR1.2,
 a shared NSG, route tables, and privatelink DNS zones. The step runs only when `network.model`
-is a build model (`byo`/`byo-spoke`/`greenfield`); `byo-existing` validates in Stage 3 and
-`managed` is RP-managed. Egress topology is switched by `network.outboundType`
+uses a documented provisioning option (`managed`/`byo`/`byo-spoke`); `byo-existing` skips this
+network deployment and validates existing networking in Stage 3. All build models use the
+same template and can modify an existing VNet's address space and subnet collection.
+The managed planning form offers `managed`; the BYO form offers `byo` (customer-defined
+provisioning), `byo-spoke` (spoke provisioning with customer-arranged hub connectivity), and
+`byo-existing` (customer-prepared existing network).
+See the [planning-form guide](scripts/USER-GUIDE.md#3-complete-the-planning-form-choices).
+Egress topology is switched separately by `network.outboundType`
 (UserDefinedRouting builds NVA route tables; LoadBalancer omits user route tables).
+Neither form provisions a firewall/NVA, NAT Gateway or hub peering. UDR requires customer-provided
+appliance connectivity, firewall rules and SNAT.
 
 FR2.3 [P0] NSG rule set. Apply the required rules per subnet NSG:
 
@@ -375,6 +457,13 @@ Convert "we think the network is ready" into a machine-checked, self-service yes
 customer can re-run without a Microsoft round trip. The networking confirmation runs from a
 disposable test VM created in the target resource group.
 
+**Deployment guidance for this release:** run Stage 3 without `-WithVm`. The optional probe
+harness has known VM-creation and connectivity-validation limitations; improvements are
+planned for the next version. Stage 3 runs static checks by default. Before deployment, confirm
+the configured firewall/NVA is reachable and verify required outbound connectivity from the SC
+node subnets; a static GO alone does not establish either. See the current-release guidance in the
+[Stage 3 user guide](scripts/USER-GUIDE.md#stage-3--validate-readiness-read-only).
+
 ### Architecture requirements
 
 FR3.1 [P0] One engine, two front ends: a headless CLI for pipelines and a VS Code extension with
@@ -398,7 +487,8 @@ FR3.6 [P1] Every failed check carries its remediation string (see the failure ca
 FR3.6a [P0] Subnet delegations match FR1.2.
 
 FR3.6b [P0] NSG effective rules include the FR2.3 set; confirm `Allow-Internet-Out` 443 and the
-east-west path exist. Use `az network nic list-effective-nsg`.
+east-west path exist. Use `az network nic list-effective-nsg`. A subnet with no NSG passes, since
+the Azure default rules allow both paths.
 
 FR3.6c [P0] Effective routes correct: managed cluster subnet resolves to `VnetLocal`, others to
 the NVA. Use `az network nic show-effective-route-table` and `az network watcher
@@ -406,6 +496,11 @@ show-next-hop`.
 
 FR3.6d [P0] Private DNS zones from FR2.5 exist and are linked; private endpoints are `Approved`
 with non-empty DNS (Bookshelf expects 3 PEs approved, Foundry endpoint carries 2 zones).
+
+FR3.6e [P0] Re-check the FR1.5 quota right before deploy, because subscription quota can drop
+between Stage 1 and Stage 4. The supercomputer profile checks vCPU quota and the workspace profile
+checks gpt-5.4 GlobalStandard TPM (450K). A shortfall blocks Stage 4 unless waived; a target
+resource that already exists in `Succeeded` state is skipped because it already holds its quota.
 
 ### Test-VM connectivity harness (the core requirement)
 
@@ -506,7 +601,8 @@ earlier tools-only `2026-02-01-preview` is superseded — do not use it.
 
 FR4.3 [P0] True-state detection. ARM resource-list can show `Succeeded` while a Foundry account is
 still `Creating`; confirm with `az cognitiveservices account show` and enforce a timeout that
-converts a stuck `Accepted`/`Creating` into a terminal, actionable failure.
+converts a stuck `Accepted`/`Creating` into a terminal, actionable failure. Pass only when both
+states are `Succeeded`; a `Failed` ARM state is never overridden by the Foundry state.
 
 FR4.4 [P1] Error-to-remediation engine. Match the ARM error signature and emit the remediation:
 
@@ -568,7 +664,7 @@ FR5.2 [P0] Create a tool via ARM PUT
 `code_environments[].infra_node` matching an `infra[].name`.
 
 FR5.3 [P0] Create the agent and bind the tool via
-`PUT ${BASE}/projects/${PROJECT}:upsertAgent`. `tools[]` is top-level with the tool ARM id;
+`POST ${BASE}/projects/${PROJECT}:upsertAgent`. `tools[]` is top-level with the tool ARM id;
 `humanInTheLoop:"Disabled"`, `confirmation:"Disabled"`; `foundryDetails.definition.kind =
 "prompt"` with `model` = chat-model deployment name. Agent instructions must call
 `GetNodePoolContext` first, or the model may answer from memory and never touch the
@@ -582,15 +678,15 @@ FR5.4 [P0] Create investigation, then conversation:
 
 FR5.5 [P0] Send the hero prompt and poll:
 
-- `POST ${BASE}/conversations/${CONV}/openai/responses`
-- `GET ${BASE}/conversations/${CONV}/openai/responses/${RID}`
+- `POST ${BASE}/conversations/${CONV}/openai/v1/responses`
+- `GET ${BASE}/conversations/${CONV}/openai/v1/responses/${RID}`
 
 FR5.6 [P0] Hard pass/fail on real tool invocation. `status: completed` is not sufficient; the
 response `output` must contain a `function_call` / `function_call_output` item, and the run
 must be visible in Foundry tracing. Absence of a tool-call item is a FAIL.
 
 FR5.7 [P1] Per-service verification summary: supercomputer/workspace/Foundry/project/chat-model
-all `Succeeded`; bookshelf (if in scope) 3 PEs approved with DNS; tool created; agent created;
+all `Succeeded`; project storage (BYO storage account behind the project's storage container) private endpoint approved with DNS; tool created; agent created;
 tool bound; conversation completed; tool actually invoked.
 
 ### Acceptance criteria
@@ -598,5 +694,11 @@ tool bound; conversation completed; tool actually invoked.
 - A run that completes without a `function_call` item is reported as not certified.
 - On success the script emits the per-service summary and a certification verdict.
 
----
+**Current implementation boundary:** FR5.6/FR5.7 tool-invocation requirements above describe
+the target scope, not the shipped Stage 5 behavior. The script creates a Q&A agent with no tool,
+requires a completed non-empty assistant answer, and checks project-storage endpoint metadata
+for privateEndpoint access (skipped for serviceEndpoint). It does not deploy Bookshelf or certify
+Bookshelf retrieval/tool invocation. See the
+[Stage 5 specification](script-specs/stage5-scenario-enablement/stage5_enable.md).
 
+---
